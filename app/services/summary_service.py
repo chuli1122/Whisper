@@ -187,6 +187,12 @@ class SummaryService:
 
             conversation_text = trimmed_text
 
+            # Append latest (retained) messages for mood detection
+            if retained_msgs:
+                retained_text = self._format_messages(retained_msgs, user_name, assistant_name)
+                if retained_text.strip():
+                    conversation_text += f"\n\n--- 以下是最新对话（仅用于判断当前情绪，不需要写入摘要） ---\n{retained_text}"
+
             # Build system prompt: full persona + summary/extraction tasks
             base_persona = (assistant.system_prompt or "").strip()
 
@@ -221,8 +227,9 @@ class SummaryService:
 - tags：给每条记忆加1-3个短关键词标签，方便检索
 
 任务三：情绪标签
-根据对话末尾{user_name}的状态判断当前情绪，从以下选一个：
+根据最新对话（分隔线以下的部分）判断{user_name}此刻的情绪状态，从以下选一个：
 sad/angry/anxious/tired/emo/happy/flirty/proud/calm
+注意：如果没有最新对话部分，则根据待压缩对话的末尾判断。
 
 输出格式：
 {{"summary": "...", "memories": [{{"content": "...", "klass": "...", "tags": ["标签1", "标签2"]}}, ...], "mood_tag": "..."}}
@@ -234,7 +241,7 @@ memories 为空时写 "memories": []
             else:
                 # Group session: no mood_tag
                 group_task = task_instructions.replace(
-                    f'根据对话末尾{user_name}的状态判断当前情绪，从以下选一个：\nsad/angry/anxious/tired/emo/happy/flirty/proud/calm',
+                    f'根据最新对话（分隔线以下的部分）判断{user_name}此刻的情绪状态，从以下选一个：\nsad/angry/anxious/tired/emo/happy/flirty/proud/calm\n注意：如果没有最新对话部分，则根据待压缩对话的末尾判断。',
                     '',
                 ).replace(', "mood_tag": "..."', '')
                 system_prompt = base_persona + "\n\n" + group_task if base_persona else group_task
