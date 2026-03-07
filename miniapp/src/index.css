@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: "Zpix";
+  src: url("../public/assets/fonts/zpix.woff2") format("woff2");
+  font-display: swap;
+}
+
+:root {
+  --bg: #e8eaed;
+  --shadow-dark: rgba(174, 176, 182, 0.5);
+  --shadow-light: #ffffff;
+  --accent: #e8a0bf;
+  --accent-dark: #c9628a;
+  --text: #3d3d50;
+  --text-muted: #8888a0;
+  --card-shadow: 6px 6px 14px rgba(174, 176, 182, 0.5), -6px -6px 14px #ffffff;
+  --card-shadow-sm: 4px 4px 10px rgba(174, 176, 182, 0.5), -4px -4px 10px #ffffff;
+  --inset-shadow: inset 3px 3px 8px rgba(174, 176, 182, 0.5), inset -3px -3px 8px #ffffff;
+  --icon-inset: inset 2px 2px 5px rgba(174, 176, 182, 0.5), inset -2px -2px 5px #ffffff;
+  --btn-active: inset 4px 4px 10px rgba(174, 176, 182, 0.6), inset -4px -4px 10px #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  height: var(--tg-viewport-height, 100%);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* Scrollable page containers */
+.page-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+
+/* Neumorphism utilities */
+.nm-raised {
+  background: var(--bg);
+  box-shadow: var(--card-shadow);
+}
+.nm-raised-sm {
+  background: var(--bg);
+  box-shadow: var(--card-shadow-sm);
+}
+.nm-inset {
+  background: var(--bg);
+  box-shadow: var(--inset-shadow);
+}
+.nm-icon {
+  box-shadow: var(--icon-inset);
+}
+.nm-active:active {
+  box-shadow: var(--btn-active) !important;
+}
+
+/* Input fields */
+.nm-input {
+  background: var(--bg);
+  box-shadow: var(--inset-shadow);
+  color: var(--text);
+  outline: none;
+  border: none;
+}
+.nm-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* Accent button */
+.btn-accent {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+  box-shadow: 4px 4px 10px rgba(201, 98, 138, 0.35), -2px -2px 6px #ffffff;
+  color: white;
+  font-weight: 600;
+  transition: all 0.15s ease;
+}
+.btn-accent:active {
+  box-shadow: inset 3px 3px 8px rgba(150, 60, 100, 0.4), inset -2px -2px 5px rgba(255,255,255,0.3);
+  transform: scale(0.97);
+}
+
+/* Gray button */
+.btn-gray {
+  background: var(--bg);
+  box-shadow: var(--card-shadow-sm);
+  color: var(--text);
+  transition: all 0.15s ease;
+}
+.btn-gray:active {
+  box-shadow: var(--inset-shadow);
+  transform: scale(0.97);
+}
+
+/* Toggle switch */
+.toggle-track {
+  background: var(--bg);
+  box-shadow: var(--inset-shadow);
+  transition: background 0.2s;
+}
+.toggle-track.on {
+  background: var(--accent);
+}
+.toggle-thumb {
+  background: white;
+  box-shadow: 2px 2px 5px rgba(174, 176, 182, 0.5);
+  transition: transform 0.2s ease;
+}
+
+/* Scrollbar hide */
+::-webkit-scrollbar {
+  display: none;
+}
+
+/* Thin scrollbar for textareas */
+.thin-scrollbar::-webkit-scrollbar {
+  display: block;
+  width: 3px;
+}
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(160, 160, 160, 0.35);
+  border-radius: 3px;
+}
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(160, 160, 160, 0.35) transparent;
+}

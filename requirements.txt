@@ -1,0 +1,15 @@
+python-dotenv
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pgvector
+openai
+anthropic
+httpx
+requests
+PyJWT
+aiogram
+python-multipart
+pdfplumber
+tavily-python

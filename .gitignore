@@ -1,0 +1,16 @@
+﻿.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.log
+.DS_Store
+frontend/dist/
+frontend/node_modules/
+node_modules/
+static/uploads/
+*.db
+*.sqlite3
+nul
+.claude/
+settings.local.json
