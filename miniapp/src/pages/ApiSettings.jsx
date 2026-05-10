@@ -535,7 +535,7 @@ export default function ApiSettings() {
             {/* Connection */}
             <Card>
               <NmInput label="API 地址" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" disabled={authType === "oauth_token"} />
-              <NmInput label="API Key" value={apiKey} onChange={setApiKey} placeholder={authType === "oauth_token" ? "sk-ant-oat01-..." : "sk-..."} password />
+              <NmInput label="API Key" value={apiKey} onChange={setApiKey} placeholder={authType === "oauth_token" ? "<oauth-token>" : "<api-key>"} password />
               <div>
                 <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>认证方式</label>
                 <SegmentControl

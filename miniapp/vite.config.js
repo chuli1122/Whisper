@@ -1,6 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const API_TARGET = process.env.VITE_API_TARGET || "http://localhost:8002";
+const WS_TARGET = process.env.VITE_WS_TARGET || API_TARGET.replace(/^http/, "ws");
+
 // Move module scripts from <head> to end of <body>
 // Fixes white screen in Telegram WebView
 function moveScriptsToBody() {
@@ -28,9 +31,9 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "https://chat.chuli.win",
+      "/api": API_TARGET,
       "/ws": {
-        target: "wss://chat.chuli.win",
+        target: WS_TARGET,
         ws: true,
         changeOrigin: true,
       },

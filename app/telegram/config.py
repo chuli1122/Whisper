@@ -11,11 +11,12 @@ _raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "0")
 ALLOWED_CHAT_ID: int = int(_raw_chat_id) if _raw_chat_id.lstrip("-").isdigit() else 0
 
 # Mini App URLs
-MINI_APP_URL: str = "https://chat.chuli.win/miniapp/?v=5#/cot"
-MINI_APP_BASE_URL: str = "https://chat.chuli.win/miniapp/"
+_default_base_url = os.getenv("WEBHOOK_BASE_URL", "http://localhost:8002").rstrip("/")
+MINI_APP_URL: str = os.getenv("MINI_APP_URL", f"{_default_base_url}/miniapp/#/cot")
+MINI_APP_BASE_URL: str = os.getenv("MINI_APP_BASE_URL", f"{_default_base_url}/miniapp/")
 
 # Webhook
-WEBHOOK_BASE_URL: str = os.getenv("WEBHOOK_BASE_URL", "https://chat.chuli.win")
+WEBHOOK_BASE_URL: str = os.getenv("WEBHOOK_BASE_URL", _default_base_url)
 
 # Defaults
 DEFAULT_BUFFER_SECONDS: float = 15.0

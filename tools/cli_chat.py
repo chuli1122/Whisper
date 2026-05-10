@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-阿澄的终端 — chuli_home CLI 聊天入口
+Local CLI chat entrypoint for the AI companion prototype.
 用法: python tools/cli_chat.py
 
-支持本地工具：阿澄可以在你的电脑上执行命令、读写文件。
+Supports local tools such as command execution and file read/write in a
+controlled development environment.
 """
 
 import base64
@@ -22,9 +23,9 @@ if os.name == "nt":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 
-API_URL = os.environ.get("CHULI_API_URL", "https://chat.chuli.win")
-DEFAULT_PASSWORD = "chuli2026bendanachengbendanahuai"
-ASSISTANT_ID = 2  # 阿澄
+API_URL = os.environ.get("CHULI_API_URL", "http://localhost:8002")
+DEFAULT_PASSWORD = ""
+ASSISTANT_ID = int(os.environ.get("ASSISTANT_ID", "1"))
 
 # ANSI colors
 DIM = "\033[2m"
@@ -62,6 +63,9 @@ def api(method: str, path: str, body: dict | None = None, token: str | None = No
 
 def login() -> str:
     password = os.environ.get("WHISPER_PASSWORD") or DEFAULT_PASSWORD
+    if not password:
+        print("请先设置 WHISPER_PASSWORD 环境变量")
+        sys.exit(1)
     try:
         result = api("POST", "/auth/verify", {"password": password})
     except urllib.error.HTTPError as e:

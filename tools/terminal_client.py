@@ -37,8 +37,8 @@ if os.name == "nt":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
     sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_API = os.environ.get("TERMINAL_API", "http://43.156.11.234:8002")
-DEFAULT_PASSWORD = "chuli2026bendanachengbendanahuai"
+DEFAULT_API = os.environ.get("TERMINAL_API", "http://localhost:8002")
+DEFAULT_PASSWORD = ""
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -52,6 +52,9 @@ CYAN = "\033[36m"
 
 def get_token() -> str:
     password = os.environ.get("WHISPER_PASSWORD") or DEFAULT_PASSWORD
+    if not password:
+        print(f"{RED}请先设置 WHISPER_PASSWORD 环境变量{RESET}")
+        sys.exit(1)
     url = f"{DEFAULT_API}/api/auth/verify"
     data = json.dumps({"password": password}).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
