@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+class RelatedMemoryInfo(BaseModel):
+    id: int
+    content: str
+    klass: str | None
+    tags: dict | None
+    disclosure: str | None
+    similarity: float | None
+
+
 class PendingMemoryItem(BaseModel):
     id: int  # real Memory id
     pending_id: int  # PendingMemory id
@@ -24,11 +33,13 @@ class PendingMemoryItem(BaseModel):
     klass: str
     importance: float
     tags: dict | None
+    disclosure: str | None
     related_memory_id: int | None
     related_memory_content: str | None
     related_memory_klass: str | None
     related_memory_tags: dict | None
     similarity: float | None
+    related_memories: list[RelatedMemoryInfo] = []
     status: str
     summary_id: int | None
     created_at: str | None
@@ -51,6 +62,7 @@ class EditPendingRequest(BaseModel):
     content: str | None = None
     klass: str | None = None
     tags: dict | None = None
+    disclosure: str | None = None
 
 
 class UpdateExistingRequest(BaseModel):
@@ -103,43 +115,60 @@ def list_pending_memories(db: Session = Depends(get_db)):
             row.resolved_at = datetime.now(TZ_EAST8)
             continue
 
-        # Re-check: has a very similar confirmed memory been saved since extraction?
+        # Re-check: find top 2 similar confirmed memories
+        related_memories: list[RelatedMemoryInfo] = []
         if memory.embedding is not None:
             emb_str = str([float(x) for x in memory.embedding])
             dup_sql = text("""
-                SELECT id, content, 1 - (embedding <=> :query_embedding) AS similarity
+                SELECT id, content, klass, tags, disclosure,
+                       1 - (embedding <=> :query_embedding) AS similarity
                 FROM memories
                 WHERE embedding IS NOT NULL AND deleted_at IS NULL
                   AND is_pending = FALSE
                 ORDER BY embedding <=> :query_embedding
-                LIMIT 1
+                LIMIT 2
             """)
-            dup = db.execute(dup_sql, {"query_embedding": emb_str}).first()
-            if dup and dup.similarity > 0.88:
+            dups = db.execute(dup_sql, {"query_embedding": emb_str}).fetchall()
+            top = dups[0] if dups else None
+            if top and top.similarity > 0.88:
                 # Auto-resolve: an equivalent confirmed memory now exists
                 row.status = "auto_resolved"
-                row.related_memory_id = dup.id
-                row.similarity = round(dup.similarity, 3)
+                row.related_memory_id = top.id
+                row.similarity = round(top.similarity, 3)
                 row.resolved_at = datetime.now(TZ_EAST8)
-                # Also clean up the pending Memory entry
                 memory.deleted_at = datetime.now(TZ_EAST8)
                 memory.is_pending = False
                 db.commit()
                 continue
-            # Update related memory info (may have changed)
-            if dup and dup.similarity > 0.5:
-                row.related_memory_id = dup.id
-                row.similarity = round(dup.similarity, 3)
+            for d in dups:
+                if d.similarity > 0.4:
+                    related_memories.append(RelatedMemoryInfo(
+                        id=d.id,
+                        content=d.content,
+                        klass=d.klass,
+                        tags=d.tags if isinstance(d.tags, dict) else None,
+                        disclosure=d.disclosure,
+                        similarity=round(d.similarity, 3),
+                    ))
+            # Keep backward compat fields (top match)
+            if related_memories:
+                row.related_memory_id = related_memories[0].id
+                row.similarity = related_memories[0].similarity
             elif row.related_memory_id:
                 existing = db.get(Memory, row.related_memory_id)
                 if not existing or existing.deleted_at:
                     row.related_memory_id = None
                     row.similarity = None
 
+        # Legacy: populate related_memory fields from top match
         related_content = None
         related_klass = None
         related_tags = None
-        if row.related_memory_id:
+        if related_memories:
+            related_content = related_memories[0].content
+            related_klass = related_memories[0].klass
+            related_tags = related_memories[0].tags
+        elif row.related_memory_id:
             related = db.get(Memory, row.related_memory_id)
             if related:
                 related_content = related.content
@@ -153,11 +182,13 @@ def list_pending_memories(db: Session = Depends(get_db)):
             klass=memory.klass,
             importance=memory.importance,
             tags=memory.tags,
+            disclosure=memory.disclosure,
             related_memory_id=row.related_memory_id,
             related_memory_content=related_content,
             related_memory_klass=related_klass,
             related_memory_tags=related_tags,
             similarity=row.similarity,
+            related_memories=related_memories,
             status=row.status,
             summary_id=row.summary_id,
             created_at=memory.created_at.isoformat() if memory.created_at else None,
@@ -269,10 +300,12 @@ def edit_pending_memory(memory_id: int, req: EditPendingRequest, db: Session = D
         memory.klass = req.klass
     if req.tags is not None:
         memory.tags = req.tags
+    if req.disclosure is not None:
+        memory.disclosure = req.disclosure.strip() or None
 
     memory.updated_at = datetime.now(TZ_EAST8)
     db.commit()
-    return {"id": memory.id, "content": memory.content, "klass": memory.klass, "tags": memory.tags}
+    return {"id": memory.id, "content": memory.content, "klass": memory.klass, "tags": memory.tags, "disclosure": memory.disclosure}
 
 
 @router.post("/pending-memories/update-existing")

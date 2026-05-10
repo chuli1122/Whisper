@@ -123,3 +123,27 @@ class CotBroadcaster:
 
 
 cot_broadcaster = CotBroadcaster()
+
+
+def publish_messages_updated(
+    session_id: int,
+    message_id: int | None = None,
+    role: str = "user",
+    assistant_id: int | None = None,
+) -> None:
+    """Tell the miniapp to refresh its message list for *session_id*.
+
+    Wrapped in try/except because the broadcast must never propagate failure
+    back to the DB write path (e.g. when there are no subscribers or the event
+    loop is shutting down).
+    """
+    try:
+        cot_broadcaster.publish({
+            "type": "messages_updated",
+            "session_id": session_id,
+            "message_id": message_id,
+            "role": role,
+            "assistant_id": assistant_id,
+        })
+    except Exception:
+        pass

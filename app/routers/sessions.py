@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import threading
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,8 +12,24 @@ from sqlalchemy.dialects.postgresql import JSONB as JSONB_TYPE
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import Assistant, ChatSession, Message, SessionSummary, UserProfile
+from app.models.models import Assistant, ChatSession, Memory, Message, SessionSummary, UserProfile
 from app.utils import format_datetime, TZ_EAST8
+
+_SCENE_HEADER_RE = re.compile(r'^\[(?:QQ|TG|微信)私聊\]\n')
+# Legacy timestamp prefix (older commits injected [YYYY-MM-DD HH:MM(:SS)] into content).
+# Kept for backward compat so older rows render clean; new messages no longer include it.
+_TIMESTAMP_RE = re.compile(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?\] ')
+
+
+def _strip_scene_prefix(content: str) -> str:
+    """Strip [QQ私聊]/[TG私聊] scene header (and legacy timestamp prefix) for UI display.
+    The scene header goes into role=user content as an anchor for the model;
+    the UI has its own timestamp rendering."""
+    if not content:
+        return content
+    content = _SCENE_HEADER_RE.sub('', content, count=1)
+    content = _TIMESTAMP_RE.sub('', content, count=1)
+    return content
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,6 +83,7 @@ class SessionMessageItem(BaseModel):
     created_at: str | None
     summarized: bool = False
     summary_group_id: int | None = None
+    image_url: str | None = None
 
 
 class SessionMessagesResponse(BaseModel):
@@ -183,18 +202,77 @@ def get_session_messages(
     tg_msg_id: int | None = Query(None),
     include_no_message: bool = Query(False),
     only_no_message: bool = Query(False),
+    only_tool: bool = Query(False),
+    only_thinking: bool = Query(False),
+    only_native_thinking: bool = Query(False),
+    only_cafe: bool = Query(False),
+    summary_group_id: int | None = Query(None),
     db: Session = Depends(get_db),
 ) -> SessionMessagesResponse:
     session_row = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if only_no_message:
+    if summary_group_id is not None:
+        # Show ALL messages (including tool calls, no_message, etc.) under a summary
+        query = db.query(Message).filter(
+            Message.session_id == session_id,
+            Message.summary_group_id == summary_group_id,
+        )
+    elif only_tool:
+        # Only return tool-related messages (tool calls + tool results)
+        query = db.query(Message).filter(
+            Message.session_id == session_id,
+            or_(
+                Message.role == "tool",
+                and_(Message.role == "assistant", Message.meta_info.has_key("tool_calls")),
+                and_(Message.role == "assistant", Message.meta_info.has_key("tool_call")),
+            ),
+        )
+    elif only_no_message:
         # Only return NO_MESSAGE judgment messages
         query = db.query(Message).filter(
             Message.session_id == session_id,
             Message.role == "assistant",
             Message.meta_info.has_key("no_message"),
+        )
+    elif only_thinking or only_native_thinking:
+        # Draft (scratchpad, block_type=thinking_fake) or native thinking summary
+        # (block_type=thinking) — both live in cot_records, not messages.
+        from app.models.models import CotRecord
+        assistant_id = session_row.assistant_id
+        _block_type = "thinking" if only_native_thinking else "thinking_fake"
+        cot_query = db.query(CotRecord).filter(
+            CotRecord.assistant_id == assistant_id,
+            CotRecord.block_type == _block_type,
+        )
+        if before_id is not None:
+            cot_query = cot_query.filter(CotRecord.id < before_id)
+        if search:
+            cot_query = cot_query.filter(CotRecord.content.like(f"%{search}%"))
+        total = cot_query.count() if before_id is None else 0
+        rows_desc = cot_query.order_by(CotRecord.id.desc()).limit(limit + 1).all()
+        has_more = len(rows_desc) > limit
+        rows_desc = rows_desc[:limit]
+        rows = list(reversed(rows_desc))
+        items = [
+            SessionMessageItem(
+                id=r.id,
+                role="assistant",
+                content=r.content,
+                meta_info={"block_type": _block_type, "is_draft": not only_native_thinking},
+                created_at=format_datetime(r.created_at),
+                summarized=False,
+                summary_group_id=None,
+                image_url=None,
+            ) for r in rows
+        ]
+        return SessionMessagesResponse(messages=items, has_more=has_more, total=total)
+    elif only_cafe:
+        # Group chat related messages (system notes + replies)
+        query = db.query(Message).filter(
+            Message.session_id == session_id,
+            cast(Message.meta_info, JSONB_TYPE)["source"].astext == "cafe",
         )
     else:
         _assistant_excludes = [
@@ -208,6 +286,8 @@ def get_session_messages(
             Message.session_id == session_id,
             Message.role.in_(["user", "assistant", "system"]),
             func.length(func.trim(Message.content)) > 0,
+            ~Message.content.like("[THINK]%"),  # legacy thinking-only messages hidden
+            ~Message.content.like("<scratchpad>%"),  # scratchpad-only messages hidden
             or_(
                 Message.role != "assistant",
                 and_(*_assistant_excludes),
@@ -240,18 +320,24 @@ def get_session_messages(
     rows_desc = rows_desc[:limit]
     rows = list(reversed(rows_desc))
 
-    items = [
-        SessionMessageItem(
+    from app.services.media_service import make_signed_url
+
+    items = []
+    for row in rows:
+        image_url = None
+        if row.image_data and row.image_data.startswith("media:"):
+            filename = row.image_data[6:]
+            image_url = make_signed_url(filename)
+        items.append(SessionMessageItem(
             id=row.id,
             role=row.role,
-            content=row.content,
+            content=_strip_scene_prefix(row.content) if row.role == "user" else row.content,
             meta_info=row.meta_info or {},
             created_at=format_datetime(row.created_at),
             summarized=row.summary_group_id is not None,
             summary_group_id=row.summary_group_id,
-        )
-        for row in rows
-    ]
+            image_url=image_url,
+        ))
 
     return SessionMessagesResponse(messages=items, has_more=has_more, total=total)
 
@@ -538,6 +624,16 @@ class BatchDeleteResponse(BaseModel):
     deleted: int
 
 
+def _rollback_memory_hits(db: Session, message: Message) -> None:
+    """Decrement hits on memories that were used by this message."""
+    meta = message.meta_info or {}
+    used_ids = meta.get("used_memory_ids", [])
+    for mid in used_ids:
+        mem = db.get(Memory, int(mid))
+        if mem and mem.hits > 0:
+            mem.hits -= 1
+
+
 @router.delete("/sessions/{session_id}/messages/batch", response_model=BatchDeleteResponse)
 def batch_delete_messages(
     session_id: int,
@@ -546,6 +642,13 @@ def batch_delete_messages(
 ) -> BatchDeleteResponse:
     if not payload.ids:
         return BatchDeleteResponse(deleted=0)
+    # Rollback memory hits before deleting
+    msgs = db.query(Message).filter(
+        Message.session_id == session_id,
+        Message.id.in_(payload.ids),
+    ).all()
+    for msg in msgs:
+        _rollback_memory_hits(db, msg)
     deleted = db.query(Message).filter(
         Message.session_id == session_id,
         Message.id.in_(payload.ids),
@@ -574,6 +677,9 @@ def delete_message(
     if message_row is None:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    # Rollback memory hits for used memories
+    _rollback_memory_hits(db, message_row)
+
     db.delete(message_row)
     db.commit()
 
@@ -581,6 +687,62 @@ def delete_message(
 
 
 # ── Summary trash / restore / permanent delete ─────────────────────────────
+
+
+def _resummarize_after_delete(
+    session_id: int, assistant_id: int | None,
+    msg_id_start: int | None, msg_id_end: int | None,
+) -> None:
+    """After deleting a summary, re-summarize the messages it used to cover.
+    Runs in a background thread so the DELETE response returns immediately."""
+    if not (assistant_id and msg_id_start and msg_id_end):
+        return
+
+    def _worker() -> None:
+        from app.database import SessionLocal as _SL
+        from app.services.summary_service import SummaryService as _SS
+        from app.services.chat.post_reply import _get_summary_lock
+        lock = _get_summary_lock(session_id)
+        if not lock.acquire(timeout=120):
+            logger.info("[resummarize] Lock timeout for session_id=%s, skipping", session_id)
+            return
+        _db = _SL()
+        try:
+            _msgs = (
+                _db.query(Message)
+                .filter(
+                    Message.session_id == session_id,
+                    Message.id.between(msg_id_start, msg_id_end),
+                    Message.role.in_(["user", "assistant", "tool"]),
+                    Message.summary_group_id.is_(None),
+                )
+                .order_by(Message.created_at.asc(), Message.id.asc())
+                .all()
+            )
+            if not _msgs:
+                logger.info(
+                    "[resummarize] No uncovered messages in [%s-%s] for session_id=%s",
+                    msg_id_start, msg_id_end, session_id,
+                )
+                return
+            for _m in _msgs:
+                _db.expunge(_m)
+            logger.info(
+                "[resummarize] Re-summarizing %d messages [%s-%s] for session_id=%s after summary delete",
+                len(_msgs), msg_id_start, msg_id_end, session_id,
+            )
+            _SS(_SL).generate_summary(session_id, _msgs, assistant_id)
+        except Exception:
+            logger.exception(
+                "[resummarize] Failed for session_id=%s [%s-%s]",
+                session_id, msg_id_start, msg_id_end,
+            )
+        finally:
+            lock.release()
+            _db.close()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 
 class TrashSummaryItem(BaseModel):
     id: int
@@ -635,6 +797,15 @@ def batch_delete_summaries(
     if not payload.ids:
         return BatchDeleteResponse(deleted=0)
     now = datetime.now(TZ_EAST8)
+    rows = db.query(SessionSummary).filter(
+        SessionSummary.session_id == session_id,
+        SessionSummary.id.in_(payload.ids),
+        SessionSummary.deleted_at.is_(None),
+    ).all()
+    resummarize_ranges = [
+        (r.assistant_id, r.msg_id_start, r.msg_id_end) for r in rows
+        if r.assistant_id and r.msg_id_start and r.msg_id_end
+    ]
     deleted = db.query(SessionSummary).filter(
         SessionSummary.session_id == session_id,
         SessionSummary.id.in_(payload.ids),
@@ -645,6 +816,8 @@ def batch_delete_summaries(
         {Message.summary_group_id: None}, synchronize_session=False,
     )
     db.commit()
+    for _aid, _start, _end in resummarize_ranges:
+        _resummarize_after_delete(session_id, _aid, _start, _end)
     return BatchDeleteResponse(deleted=deleted)
 
 
@@ -665,12 +838,16 @@ def delete_summary(
     )
     if not row:
         raise HTTPException(status_code=404, detail="Summary not found")
+    _msg_id_start = row.msg_id_start
+    _msg_id_end = row.msg_id_end
+    _assistant_id = row.assistant_id
     row.deleted_at = datetime.now(TZ_EAST8)
     # Clear summary_group_id so messages can be re-summarized
     db.query(Message).filter(Message.summary_group_id == summary_id).update(
         {Message.summary_group_id: None}, synchronize_session=False,
     )
     db.commit()
+    _resummarize_after_delete(session_id, _assistant_id, _msg_id_start, _msg_id_end)
     return SummaryDeleteResponse(status="deleted", id=summary_id)
 
 
@@ -742,6 +919,14 @@ def update_summary_content(
     )
     if not row:
         raise HTTPException(status_code=404, detail="Summary not found")
+    # Snapshot before overwrite
+    from app.models.models import SummaryVersion
+    db.add(SummaryVersion(
+        summary_id=row.id,
+        summary_content=row.summary_content,
+        mood_tag=row.mood_tag,
+        changed_by="admin",
+    ))
     row.summary_content = payload.summary_content
     db.commit()
     db.refresh(row)
@@ -758,6 +943,72 @@ def update_summary_content(
         merged_into=row.merged_into,
         created_at=format_datetime(row.created_at),
     )
+
+
+class SummaryVersionItem(BaseModel):
+    id: int
+    summary_content: str
+    mood_tag: str | None
+    changed_by: str
+    created_at: str | None
+
+
+@router.get("/summaries/{summary_id}/versions")
+def get_summary_versions(
+    summary_id: int,
+    db: Session = Depends(get_db),
+) -> list[SummaryVersionItem]:
+    from app.models.models import SummaryVersion
+    versions = (
+        db.query(SummaryVersion)
+        .filter(SummaryVersion.summary_id == summary_id)
+        .order_by(SummaryVersion.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        SummaryVersionItem(
+            id=v.id,
+            summary_content=v.summary_content,
+            mood_tag=v.mood_tag,
+            changed_by=v.changed_by,
+            created_at=format_datetime(v.created_at),
+        )
+        for v in versions
+    ]
+
+
+@router.post("/summaries/{summary_id}/rollback/{version_id}")
+def rollback_summary(
+    summary_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+):
+    from app.models.models import SummaryVersion
+    row = db.query(SessionSummary).filter(
+        SessionSummary.id == summary_id,
+        SessionSummary.deleted_at.is_(None),
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Summary not found")
+    version = db.query(SummaryVersion).filter(
+        SummaryVersion.id == version_id,
+        SummaryVersion.summary_id == summary_id,
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+    # Snapshot current before rollback
+    db.add(SummaryVersion(
+        summary_id=row.id,
+        summary_content=row.summary_content,
+        mood_tag=row.mood_tag,
+        changed_by="rollback",
+    ))
+    row.summary_content = version.summary_content
+    if version.mood_tag is not None:
+        row.mood_tag = version.mood_tag
+    db.commit()
+    return {"status": "rolled_back", "summary_id": summary_id, "to_version_id": version_id}
 
 
 # ── Session info with assistant name ────────────────────────────────────────

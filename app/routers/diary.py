@@ -22,6 +22,7 @@ class DiaryItem(BaseModel):
     title: str
     content: str
     is_read: bool
+    read_at: str | None
     unlock_at: str | None
     deleted_at: str | None
     created_at: str | None
@@ -38,6 +39,12 @@ class DiaryCreateRequest(BaseModel):
     title: str = ""
     content: str
     unlock_at: str | None = None  # ISO datetime
+
+
+class DiaryUpdateRequest(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    unlock_at: str | None = None  # ISO datetime, or "" to clear
 
 
 class DiaryDeleteResponse(BaseModel):
@@ -62,6 +69,7 @@ def _row_to_item(row: Diary) -> DiaryItem:
         title=row.title,
         content=row.content,
         is_read=row.is_read,
+        read_at=format_datetime(row.read_at) if hasattr(row, "read_at") and row.read_at else None,
         unlock_at=format_datetime(row.unlock_at) if hasattr(row, "unlock_at") and row.unlock_at else None,
         deleted_at=format_datetime(row.deleted_at) if hasattr(row, "deleted_at") and row.deleted_at else None,
         created_at=format_datetime(row.created_at),
@@ -135,6 +143,49 @@ def create_diary(
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # Wake up proactive loop for immediate user diaries
+    if (payload.author or "user") == "user" and not unlock:
+        try:
+            from app.services.proactive_service import _notify_wakeup
+            _notify_wakeup()
+        except Exception:
+            pass
+
+    return _row_to_item(row)
+
+
+@router.put("/diary/{diary_id}", response_model=DiaryItem)
+def update_diary(
+    diary_id: int,
+    payload: DiaryUpdateRequest,
+    db: Session = Depends(get_db),
+) -> DiaryItem:
+    row = db.query(Diary).filter(Diary.id == diary_id, Diary.deleted_at.is_(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Diary not found")
+    if row.author != "user":
+        raise HTTPException(status_code=403, detail="只能编辑自己写的日记")
+    now = datetime.now(TZ_EAST8)
+    if row.unlock_at and row.unlock_at <= now:
+        raise HTTPException(status_code=403, detail="已解锁的日记不能编辑")
+    if not row.unlock_at and row.notified_at:
+        raise HTTPException(status_code=403, detail="已发出的日记不能编辑")
+
+    if payload.title is not None:
+        row.title = payload.title
+    if payload.content is not None:
+        row.content = payload.content
+    if payload.unlock_at is not None:
+        if payload.unlock_at == "":
+            row.unlock_at = None
+        else:
+            try:
+                row.unlock_at = datetime.fromisoformat(payload.unlock_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid unlock_at format")
+    db.commit()
+    db.refresh(row)
     return _row_to_item(row)
 
 
@@ -143,7 +194,9 @@ def mark_diary_read(diary_id: int, db: Session = Depends(get_db)) -> DiaryReadRe
     row = db.query(Diary).filter(Diary.id == diary_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Diary not found")
+    from datetime import datetime, timezone, timedelta
     row.is_read = True
+    row.read_at = datetime.now(timezone(timedelta(hours=8)))
     db.commit()
     return DiaryReadResponse(status="ok", id=diary_id)
 

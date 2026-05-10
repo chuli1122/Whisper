@@ -291,6 +291,7 @@ export default function WorldBookEdit() {
   const isNew = !id;
 
   const [name, setName] = useState("");
+  const [xmlTag, setXmlTag] = useState("");
   const [folder, setFolder] = useState("");
   const [activation, setActivation] = useState("always");
   const [keywords, setKeywords] = useState([]);
@@ -329,6 +330,7 @@ export default function WorldBookEdit() {
           const book = books.find((b) => String(b.id) === String(id));
           if (book) {
             setName(book.name);
+            setXmlTag(book.xml_tag || "");
             setFolder(book.folder || "");
             setActivation(book.activation);
             setKeywords(book.keywords || []);
@@ -347,6 +349,7 @@ export default function WorldBookEdit() {
     try {
       const body = {
         name: name.trim(),
+        xml_tag: xmlTag.trim() || null,
         folder: folder.trim() || null,
         activation,
         keywords: activation === "keyword" || activation === "mood" ? keywords : [],
@@ -409,6 +412,7 @@ export default function WorldBookEdit() {
           style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}
         >
           <NmInput label="名称" value={name} onChange={setName} placeholder="世界书名称" />
+          <NmInput label="XML标签" value={xmlTag} onChange={setXmlTag} placeholder="英文标签名，如 nsfw_guide" />
           <FolderInput value={folder} onChange={setFolder} folders={allFolders} />
           <ActivationSelector value={activation} onChange={setActivation} />
           {activation === "keyword" && (

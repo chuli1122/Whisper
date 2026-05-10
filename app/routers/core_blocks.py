@@ -75,7 +75,7 @@ class CoreBlockRewriteResponse(BaseModel):
 
 @router.get("/core-blocks/candidates", response_model=CoreBlockCandidatesResponse)
 def list_core_block_candidates(
-    status: str | None = Query("pending"),
+    status: str | None = Query(None),
     block_type: str | None = Query(None),
     assistant_id: int | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -258,6 +258,43 @@ def delete_core_block_history(
     row = db.query(CoreBlockHistory).filter(CoreBlockHistory.id == history_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="History entry not found")
+    db.delete(row)
+    db.commit()
+    return {"success": True}
+
+
+# ── Candidate update / delete ──────────────────────────────────────────────
+
+class CandidateUpdateRequest(BaseModel):
+    content: str | None = None
+    status: str | None = None
+
+
+@router.put("/core-blocks/candidates/{candidate_id}")
+def update_candidate(
+    candidate_id: int,
+    payload: CandidateUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    row = db.query(CoreBlockCandidate).filter(CoreBlockCandidate.id == candidate_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if payload.content is not None:
+        row.content = payload.content
+    if payload.status is not None:
+        row.status = payload.status
+    db.commit()
+    return {"success": True}
+
+
+@router.delete("/core-blocks/candidates/{candidate_id}")
+def delete_candidate(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+):
+    row = db.query(CoreBlockCandidate).filter(CoreBlockCandidate.id == candidate_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Candidate not found")
     db.delete(row)
     db.commit()
     return {"success": True}

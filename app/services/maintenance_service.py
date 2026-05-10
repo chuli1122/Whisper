@@ -168,4 +168,11 @@ LIMIT 50
             logger.warning("cleanup_trash failed: %s", exc)
             result["trash_cleaned"] = -1
 
+        try:
+            from app.services.media_service import cleanup_old_files
+            result["media_cleaned"] = cleanup_old_files()
+        except Exception as exc:
+            logger.warning("cleanup_old_files failed: %s", exc)
+            result["media_cleaned"] = -1
+
         return result

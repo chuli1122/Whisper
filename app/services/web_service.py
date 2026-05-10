@@ -40,7 +40,7 @@ def web_search(payload: dict) -> dict:
             {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
             for r in resp.get("results", [])
         ]
-        return {"query": query, "results": results}
+        return {"query": query, "results": results, "_cache_key": f"web_search:{query}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -92,4 +92,5 @@ def web_fetch(payload: dict) -> dict:
         "total_length": len(full_content),
         "current_offset": offset,
         "has_more": has_more,
+        "_cache_key": f"web_fetch:{url}:{offset}",
     }

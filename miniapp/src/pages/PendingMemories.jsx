@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronLeft, Check, Pencil, ChevronDown, Link } from "lucide-react";
+import { ChevronLeft, Check, Pencil, ChevronDown, Link, FileText, X } from "lucide-react";
 import { apiFetch } from "../utils/api";
 
 const S = {
@@ -85,6 +85,7 @@ function EditModal({ item, onSave, onCancel }) {
   const [text, setText] = useState(item.content);
   const [klass, setKlass] = useState(item.klass || "other");
   const [tagsText, setTagsText] = useState((item.tags?.topic || []).join(", "));
+  const [disclosure, setDisclosure] = useState(item.disclosure || "");
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: "rgba(0,0,0,0.25)" }} onClick={onCancel}>
       <div className="mx-5 w-full max-w-[340px] rounded-[18px] p-4" style={{ background: S.bg, boxShadow: "0 8px 30px rgba(0,0,0,0.18)" }} onClick={(e) => e.stopPropagation()}>
@@ -121,6 +122,16 @@ function EditModal({ item, onSave, onCancel }) {
             />
           </div>
         </div>
+        <div className="mt-2 flex items-start gap-2">
+          <span className="text-[11px] font-medium mt-1.5" style={{ color: S.textMuted, width: 22, lineHeight: '14px' }}>触发条件</span>
+          <textarea
+            className="flex-1 rounded-[10px] px-3 py-1.5 text-[11px] outline-none resize-none"
+            style={{ background: S.bg, boxShadow: "var(--inset-shadow)", color: S.text, minHeight: 40, maxHeight: 100 }}
+            placeholder="什么情况下触发这条记忆"
+            value={disclosure}
+            onChange={(e) => setDisclosure(e.target.value)}
+          />
+        </div>
         <div className="mt-3 flex gap-3">
           <button className="flex-1 rounded-[12px] py-2 text-[12px] font-medium" style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.textMuted }} onClick={onCancel}>取消</button>
           <button
@@ -128,7 +139,7 @@ function EditModal({ item, onSave, onCancel }) {
             style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.accentDark }}
             onClick={() => {
               const topics = tagsText.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
-              onSave(text.trim(), klass, { topic: topics });
+              onSave(text.trim(), klass, { topic: topics }, disclosure.trim());
             }}
             disabled={!text.trim()}
           >
@@ -142,51 +153,85 @@ function EditModal({ item, onSave, onCancel }) {
 
 /* ── Related memory expandable ── */
 
-function RelatedMemory({ relatedId, relatedContent, relatedKlass, relatedTags, similarity, onOverwrite }) {
-  const [expanded, setExpanded] = useState(false);
-  if (!relatedId || !relatedContent) return null;
-  const pct = similarity ? Math.round(similarity * 100) : null;
-  const rc = KLASS_COLORS[relatedKlass] || KLASS_COLORS.other;
-  const rTopics = relatedTags?.topic || [];
+
+function RelatedMemories({ memories, legacyRelated, onOverwrite, onEditRelated }) {
+  const [expandedId, setExpandedId] = useState(null);
+  const list = memories && memories.length > 0
+    ? memories
+    : legacyRelated?.id
+      ? [legacyRelated]
+      : [];
+  if (list.length === 0) return null;
 
   return (
     <div className="mt-1.5">
-      <button
-        className="flex items-center gap-1 text-[10px]"
-        style={{ color: "#c47a30" }}
-        onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
-      >
-        <Link size={10} />
-        <span>相似记忆 #{relatedId}{pct ? ` (${pct}%)` : ""}</span>
-        <ChevronDown size={10} style={{ transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s" }} />
-      </button>
-      {expanded && (
-        <div className="mt-1 rounded-[10px] p-2.5" style={{ boxShadow: "var(--inset-shadow)", background: S.bg }}>
-          <div className="flex flex-wrap items-center gap-1 mb-1">
-            {relatedKlass && <span className="inline-block rounded-full px-2 py-0.5 text-[10px] font-medium" style={{ background: rc.bg, color: rc.color }}>{relatedKlass}</span>}
-            {rTopics.map((t, i) => (
-              <span key={i} className="inline-block rounded-full px-1.5 py-0.5 text-[9px]" style={{ background: "rgba(136,136,160,0.1)", color: S.textMuted }}>{t}</span>
-            ))}
-          </div>
-          <p className="text-[11px] leading-relaxed whitespace-pre-wrap" style={{ color: S.text }}>{relatedContent}</p>
-          <div className="mt-2 flex justify-end">
+      {/* Toggle buttons side by side */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {list.map((mem) => {
+          const pct = mem.similarity ? Math.round(mem.similarity * 100) : null;
+          const isOpen = expandedId === mem.id;
+          return (
             <button
-              className="rounded-[8px] px-3 py-1 text-[10px] font-medium"
-              style={{ background: "rgba(196,122,48,0.12)", color: "#c47a30" }}
-              onClick={(e) => { e.stopPropagation(); onOverwrite(); }}
+              key={mem.id}
+              className="flex items-center gap-1 text-[10px] rounded-full px-1.5 py-0.5"
+              style={{ color: "#c47a30", background: isOpen ? "rgba(196,122,48,0.12)" : "transparent" }}
+              onClick={(e) => { e.stopPropagation(); setExpandedId(isOpen ? null : mem.id); }}
             >
-              覆盖原有
+              <Link size={10} />
+              <span>相似记忆 #{mem.id}{pct ? ` (${pct}%)` : ""}</span>
+              <ChevronDown size={10} style={{ transform: isOpen ? "rotate(180deg)" : "none", transition: "transform 0.2s" }} />
             </button>
+          );
+        })}
+      </div>
+      {/* Expanded card */}
+      {expandedId && (() => {
+        const mem = list.find((m) => m.id === expandedId);
+        if (!mem) return null;
+        const rc = KLASS_COLORS[mem.klass] || KLASS_COLORS.other;
+        const topics = mem.tags?.topic || [];
+        return (
+          <div className="mt-1 rounded-[10px] p-2.5" style={{ boxShadow: "var(--inset-shadow)", background: S.bg }}>
+            <div className="flex items-start justify-between gap-1">
+              <div className="flex-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-1 mb-1">
+                  {mem.klass && <span className="inline-block rounded-full px-2 py-0.5 text-[10px] font-medium" style={{ background: rc.bg, color: rc.color }}>{mem.klass}</span>}
+                  {topics.map((t, i) => (
+                    <span key={i} className="inline-block rounded-full px-1.5 py-0.5 text-[9px]" style={{ background: "rgba(136,136,160,0.1)", color: S.textMuted }}>{t}</span>
+                  ))}
+                </div>
+                {mem.disclosure && (
+                  <p className="text-[10px] mb-1" style={{ color: S.textMuted }}>触发: {mem.disclosure}</p>
+                )}
+                <p className="text-[11px] leading-relaxed whitespace-pre-wrap" style={{ color: S.text }}>{mem.content}</p>
+              </div>
+              <button
+                className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full"
+                style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                onClick={(e) => { e.stopPropagation(); onEditRelated(mem); }}
+              >
+                <Pencil size={9} style={{ color: "#c47a30" }} />
+              </button>
+            </div>
+            <div className="mt-2 flex justify-end">
+              <button
+                className="rounded-[8px] px-3 py-1 text-[10px] font-medium"
+                style={{ background: "rgba(196,122,48,0.12)", color: "#c47a30" }}
+                onClick={(e) => { e.stopPropagation(); onOverwrite(mem.id); }}
+              >
+                覆盖原有
+              </button>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
 
 /* ── Card ── */
 
-function PendingCard({ item, selected, onToggle, onEdit, onOverwrite }) {
+function PendingCard({ item, selected, onToggle, onEdit, onOverwrite, onEditRelated }) {
   const [expanded, setExpanded] = useState(false);
   const [overflows, setOverflows] = useState(false);
   const textRef = useRef(null);
@@ -219,12 +264,15 @@ function PendingCard({ item, selected, onToggle, onEdit, onOverwrite }) {
                 <span key={i} className="inline-block rounded-full px-1.5 py-0.5 text-[9px]" style={{ background: "rgba(136,136,160,0.1)", color: S.textMuted }}>{t}</span>
               ))}
             </div>
+            {/* Disclosure — between tags and content, same as Memories.jsx */}
+            {item.disclosure && (
+              <p className="text-[10px] mb-1" style={{ color: S.textMuted }}>触发: {item.disclosure}</p>
+            )}
             {/* Content */}
             <div
               ref={textRef}
-              className="text-[12px] leading-relaxed break-words cursor-pointer"
+              className="text-[12px] leading-relaxed break-words"
               style={expanded ? { color: S.text } : { color: S.text, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}
-              onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
             >
               {item.content}
             </div>
@@ -240,14 +288,19 @@ function PendingCard({ item, selected, onToggle, onEdit, onOverwrite }) {
                 </button>
               </div>
             )}
-            {/* Related memory */}
-            <RelatedMemory
-              relatedId={item.related_memory_id}
-              relatedContent={item.related_memory_content}
-              relatedKlass={item.related_memory_klass}
-              relatedTags={item.related_memory_tags}
-              similarity={item.similarity}
+            {/* Related memories */}
+            <RelatedMemories
+              memories={item.related_memories}
+              legacyRelated={item.related_memory_id ? {
+                id: item.related_memory_id,
+                content: item.related_memory_content,
+                klass: item.related_memory_klass,
+                tags: item.related_memory_tags,
+                disclosure: null,
+                similarity: item.similarity,
+              } : null}
               onOverwrite={onOverwrite}
+              onEditRelated={onEditRelated}
             />
           </div>
           {/* Edit button */}
@@ -259,8 +312,9 @@ function PendingCard({ item, selected, onToggle, onEdit, onOverwrite }) {
             <Pencil size={11} style={{ color: S.accentDark }} />
           </button>
         </div>
-        <div className="mt-1">
+        <div className="mt-1 flex items-center justify-between">
           <span className="text-[10px]" style={{ color: S.textMuted }}>{fmtTime(item.created_at)}</span>
+          <span className="text-[10px]" style={{ color: item.content.length > 120 ? "#b5454a" : S.textMuted }}>{item.content.length}字</span>
         </div>
       </div>
     </div>
@@ -287,8 +341,23 @@ export default function PendingMemories() {
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [editing, setEditing] = useState(null); // item being edited
+  const [editingRelated, setEditingRelated] = useState(null); // related memory being edited
   const [dialog, setDialog] = useState(null); // { type, ... }
   const [busy, setBusy] = useState(false);
+  const [logView, setLogView] = useState(() => localStorage.getItem("pendingMemories_logView") === "true");
+  const [triggerBusy, setTriggerBusy] = useState(false);
+  const [reflectModal, setReflectModal] = useState(false);
+  const [reflectStart, setReflectStart] = useState("");
+  const [reflectEnd, setReflectEnd] = useState("");
+  const [reflectTasks, setReflectTasks] = useState({ disclosure: true, merge: true, outdated: true, classify: true });
+  const [totalMemories, setTotalMemories] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [reflectTab, setReflectTab] = useState("pending"); // "pending" | "history"
+  const [pendingChanges, setPendingChanges] = useState([]);
+  const [pendingLoading, setPendingLoading] = useState(false);
+  const [historyItems, setHistoryItems] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [editingPending, setEditingPending] = useState(null); // { id, proposed_content }
 
   const load = () => {
     setLoading(true);
@@ -306,7 +375,95 @@ export default function PendingMemories() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(); }, []);
+  const loadPendingChanges = () => {
+    setPendingLoading(true);
+    apiFetch("/api/reflection/pending")
+      .then((data) => setPendingChanges(data.items || []))
+      .catch(() => {})
+      .finally(() => setPendingLoading(false));
+  };
+
+  const loadHistory = () => {
+    setHistoryLoading(true);
+    apiFetch("/api/reflection/history")
+      .then((data) => setHistoryItems(data.items || []))
+      .catch(() => {})
+      .finally(() => setHistoryLoading(false));
+  };
+
+  const handleConfirmPending = async (ids) => {
+    try {
+      await apiFetch("/api/reflection/pending/confirm", { method: "POST", body: { ids } });
+      loadPendingChanges();
+    } catch {}
+  };
+
+  const handleRejectPending = async (ids) => {
+    try {
+      await apiFetch("/api/reflection/pending/reject", { method: "POST", body: { ids } });
+      loadPendingChanges();
+    } catch {}
+  };
+
+  const handleConfirmAllPending = async () => {
+    try {
+      await apiFetch("/api/reflection/pending/confirm-all", { method: "POST" });
+      loadPendingChanges();
+    } catch {}
+  };
+
+  const handleRejectAllPending = async () => {
+    try {
+      await apiFetch("/api/reflection/pending/reject-all", { method: "POST" });
+      loadPendingChanges();
+    } catch {}
+  };
+
+  const handleEditPendingContent = async (id, proposedContent) => {
+    try {
+      await apiFetch(`/api/reflection/pending/${id}`, { method: "PATCH", body: { proposed_content: proposedContent } });
+      loadPendingChanges();
+    } catch {}
+    setEditingPending(null);
+  };
+
+  const openReflectModal = async () => {
+    setReflectStart("");
+    setReflectEnd("");
+    setReflectTasks({ disclosure: true, merge: true, outdated: true, classify: true });
+    setReflectModal(true);
+    try {
+      const r = await apiFetch("/api/reflection/memory-count");
+      setTotalMemories(r.total);
+    } catch { setTotalMemories(null); }
+  };
+
+  const triggerReflection = async () => {
+    if (triggerBusy) return;
+    setTriggerBusy(true);
+    setReflectModal(false);
+    try {
+      const body = { tasks: reflectTasks };
+      const s = parseInt(reflectStart, 10);
+      const e = parseInt(reflectEnd, 10);
+      if (s > 0 && e > 0) {
+        body.start = s;
+        body.end = e;
+      }
+      await apiFetch("/api/reflection/trigger", {
+        method: "POST",
+        body: body,
+      });
+      setToast("反思已在后台运行，可前往COT查看进度");
+      setTimeout(() => setToast(null), 3000);
+    } catch {
+      setToast("触发失败");
+      setTimeout(() => setToast(null), 2000);
+    }
+    setTriggerBusy(false);
+  };
+
+  useEffect(() => { load(); if (logView) loadPendingChanges(); }, []);
 
   const toggleSelect = (id) => {
     setSelectedIds((prev) => {
@@ -371,16 +528,28 @@ export default function PendingMemories() {
     setDialog(null);
   };
 
-  const handleEdit = async (content, klass, tags) => {
+  const handleEdit = async (content, klass, tags, disclosure) => {
     if (!editing) return;
     try {
       await apiFetch(`/api/pending-memories/${editing.id}`, {
         method: "PATCH",
-        body: { content, klass, tags },
+        body: { content, klass, tags, disclosure: disclosure || null },
       });
       load();
     } catch {}
     setEditing(null);
+  };
+
+  const handleEditRelated = async (content, klass, tags, disclosure) => {
+    if (!editingRelated) return;
+    try {
+      await apiFetch(`/api/memories/${editingRelated.id}`, {
+        method: "PUT",
+        body: { content, klass, tags, disclosure: disclosure || null },
+      });
+      load();
+    } catch {}
+    setEditingRelated(null);
   };
 
   /* ── Group by summary_id ── */
@@ -411,49 +580,349 @@ export default function PendingMemories() {
         >
           <ChevronLeft size={22} style={{ color: S.text }} />
         </button>
-        <h1 className="text-[17px] font-bold" style={{ color: S.text }}>摘要提取记忆</h1>
-        <div className="w-10" /> {/* spacer */}
+        <h1 className="text-[17px] font-bold" style={{ color: S.text }}>{logView ? "反思日志" : "摘要提取记忆"}</h1>
+        <button
+          className="flex h-10 w-10 items-center justify-center rounded-full"
+          style={{ background: S.bg, boxShadow: logView ? "var(--inset-shadow)" : "var(--card-shadow-sm)" }}
+          onClick={() => { const next = !logView; if (next) { setReflectTab("pending"); loadPendingChanges(); } setLogView(next); localStorage.setItem("pendingMemories_logView", String(next)); }}
+        >
+          <FileText size={18} style={{ color: logView ? S.accentDark : S.text }} />
+        </button>
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-5 pb-6 pt-3">
-        {loading ? (
-          <div className="flex justify-center py-16">
-            <div className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent" style={{ borderColor: `${S.accentDark} transparent ${S.accentDark} ${S.accentDark}` }} />
-          </div>
-        ) : items.length === 0 ? (
-          <p className="py-16 text-center text-[13px]" style={{ color: S.textMuted }}>没有待审的提取记忆</p>
-        ) : (
-          groups.map((group, gi) => (
-            <div key={gi}>
-              {group.summaryId && <SummaryDivider summaryId={group.summaryId} />}
-              {group.items.map((item) => (
-                <PendingCard
-                  key={item.id}
-                  item={item}
-                  selected={selectedIds.has(item.id)}
-                  onToggle={() => toggleSelect(item.id)}
-                  onEdit={() => setEditing(item)}
-                  onOverwrite={() => {
-                    setDialog({
-                      type: "overwrite",
-                      title: "覆盖确认",
-                      message: `确定用这条提取记忆覆盖已有记忆 #${item.related_memory_id} 吗？`,
-                      onConfirm: () => handleOverwrite(item.id, item.related_memory_id),
-                    });
-                  }}
-                />
-              ))}
+        {logView ? (
+          /* ── Reflection Tab View ── */
+          <>
+            {/* Tab bar */}
+            <div className="flex gap-2 px-5 mb-3">
+              <button
+                className="flex-1 rounded-full py-2 text-[13px] font-semibold text-center"
+                style={{
+                  background: S.bg,
+                  boxShadow: reflectTab === "pending" ? "var(--inset-shadow)" : "var(--card-shadow-sm)",
+                  color: reflectTab === "pending" ? S.accentDark : S.text,
+                }}
+                onClick={() => { setReflectTab("pending"); loadPendingChanges(); }}
+              >
+                待确认
+              </button>
+              <button
+                className="flex-1 rounded-full py-2 text-[13px] font-semibold text-center"
+                style={{
+                  background: S.bg,
+                  boxShadow: reflectTab === "history" ? "var(--inset-shadow)" : "var(--card-shadow-sm)",
+                  color: reflectTab === "history" ? S.accentDark : S.text,
+                }}
+                onClick={() => { setReflectTab("history"); loadHistory(); }}
+              >
+                历史
+              </button>
             </div>
-          ))
+
+            {reflectTab === "pending" ? (
+              /* ── Pending Changes Tab ── */
+              pendingLoading ? (
+                <div className="flex justify-center py-16">
+                  <div className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent" style={{ borderColor: `${S.accentDark} transparent ${S.accentDark} ${S.accentDark}` }} />
+                </div>
+              ) : pendingChanges.length === 0 ? (
+                <p className="py-16 text-center text-[13px]" style={{ color: S.textMuted }}>暂无待确认变更</p>
+              ) : (
+                pendingChanges.map((c) => {
+                  const actionMap = { update: "更新", delete: "删除", merge: "合并" };
+                  const actionColors = {
+                    update: { bg: "#deedf5", color: "#4a8ab5" },
+                    delete: { bg: "#f5dede", color: "#b5454a" },
+                    merge: { bg: "#ede4f7", color: "#7b5ea7" },
+                  };
+                  const ac = actionColors[c.action] || actionColors.update;
+                  return (
+                    <div
+                      key={c.id}
+                      className="mb-3 rounded-[18px] p-3"
+                      style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                    >
+                      {/* Top row: action badge + memory link + edit + confirm/reject */}
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <span
+                          className="inline-block rounded-full px-2 py-0.5 text-[10px] font-medium"
+                          style={{ background: ac.bg, color: ac.color }}
+                        >
+                          {actionMap[c.action] || c.action}
+                        </span>
+                        <button
+                          className="text-[11px] font-medium"
+                          style={{ color: S.accentDark }}
+                          onClick={() => navigate(`/memories?highlight=${c.memory_id}`)}
+                        >
+                          #{c.memory_id}
+                        </button>
+                        {c.action === "merge" && c.merge_into_id && (
+                          <button
+                            className="text-[11px] font-medium"
+                            style={{ color: S.accentDark }}
+                            onClick={() => navigate(`/memories?highlight=${c.merge_into_id}`)}
+                          >
+                            → #{c.merge_into_id}
+                          </button>
+                        )}
+                        <div className="ml-auto flex items-center gap-1.5">
+                          <button
+                            className="flex h-6 w-6 items-center justify-center rounded-full"
+                            style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                            onClick={() => setEditingPending({ id: c.id, proposed_content: c.proposed_content || c.new_content || "" })}
+                          >
+                            <Pencil size={11} style={{ color: S.accentDark }} />
+                          </button>
+                          <button
+                            className="flex items-center justify-center rounded-full px-2 py-1 text-[10px] font-medium"
+                            style={{ background: "#dff0e4", color: "#4a9b6e" }}
+                            onClick={() => handleConfirmPending([c.id])}
+                          >
+                            <Check size={11} />
+                          </button>
+                          <button
+                            className="flex items-center justify-center rounded-full px-2 py-1 text-[10px] font-medium"
+                            style={{ background: "#f5dede", color: "#b5454a" }}
+                            onClick={() => handleRejectPending([c.id])}
+                          >
+                            <X size={11} />
+                          </button>
+                        </div>
+                      </div>
+                      {/* Diff content */}
+                      {c.action === "update" && (
+                        <div className="space-y-0.5">
+                          {c.old_content && c.old_content !== (c.proposed_content || c.new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>{c.old_content}</p>
+                          )}
+                          {(c.proposed_content || c.new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#4a9b6e" }}>{c.proposed_content || c.new_content}</p>
+                          )}
+                          {c.old_klass !== c.new_klass && c.old_klass && (
+                            <p className="text-[10px]" style={{ color: S.textMuted }}>分类: {c.old_klass} → {c.new_klass}</p>
+                          )}
+                          {c.old_disclosure !== c.new_disclosure && (c.old_disclosure || c.new_disclosure) && (
+                            <p className="text-[10px]" style={{ color: S.textMuted }}>触发: {c.old_disclosure || "无"} → {c.new_disclosure || "无"}</p>
+                          )}
+                        </div>
+                      )}
+                      {c.action === "delete" && c.old_content && (
+                        <p className="text-[10px] leading-relaxed" style={{ color: S.textMuted, textDecoration: "line-through" }}>{c.old_content}</p>
+                      )}
+                      {c.action === "merge" && (
+                        <div className="space-y-0.5">
+                          {c.old_content && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>#{c.memory_id}: {c.old_content}</p>
+                          )}
+                          {c.merge_target_old_content && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>#{c.merge_into_id}: {c.merge_target_old_content}</p>
+                          )}
+                          {(c.proposed_content || c.merge_target_new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#4a9b6e" }}>→ {c.proposed_content || c.merge_target_new_content}</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )
+            ) : (
+              /* ── History Tab ── */
+              historyLoading ? (
+                <div className="flex justify-center py-16">
+                  <div className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent" style={{ borderColor: `${S.accentDark} transparent ${S.accentDark} ${S.accentDark}` }} />
+                </div>
+              ) : historyItems.length === 0 ? (
+                <p className="py-16 text-center text-[13px]" style={{ color: S.textMuted }}>暂无历史记录</p>
+              ) : (
+                historyItems.map((c) => {
+                  const actionMap = { update: "更新", delete: "删除", merge: "合并" };
+                  const actionColors = {
+                    update: { bg: "#deedf5", color: "#4a8ab5" },
+                    delete: { bg: "#f5dede", color: "#b5454a" },
+                    merge: { bg: "#ede4f7", color: "#7b5ea7" },
+                  };
+                  const ac = actionColors[c.action] || actionColors.update;
+                  const isConfirmed = c.status === "confirmed";
+                  return (
+                    <div
+                      key={c.id}
+                      className="mb-3 rounded-[18px] p-3"
+                      style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                    >
+                      {/* Top row: status + action + memory link + timestamp */}
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <span
+                          className="inline-block rounded-full px-2 py-0.5 text-[10px] font-medium"
+                          style={{
+                            background: c.status === "confirmed" ? "#dff0e4" : c.status === "reverted" ? "#fef3e0" : "#ececec",
+                            color: c.status === "confirmed" ? "#4a9b6e" : c.status === "reverted" ? "#c47a20" : "#999",
+                          }}
+                        >
+                          {c.status === "confirmed" ? "已确认" : c.status === "reverted" ? "已撤销" : "已拒绝"}
+                        </span>
+                        <span
+                          className="inline-block rounded-full px-2 py-0.5 text-[10px] font-medium"
+                          style={{ background: ac.bg, color: ac.color }}
+                        >
+                          {actionMap[c.action] || c.action}
+                        </span>
+                        <button
+                          className="text-[11px] font-medium"
+                          style={{ color: S.accentDark }}
+                          onClick={() => navigate(`/memories?highlight=${c.memory_id}`)}
+                        >
+                          #{c.memory_id}
+                        </button>
+                        {c.action === "merge" && c.merge_into_id && (
+                          <button
+                            className="text-[11px] font-medium"
+                            style={{ color: S.accentDark }}
+                            onClick={() => navigate(`/memories?highlight=${c.merge_into_id}`)}
+                          >
+                            → #{c.merge_into_id}
+                          </button>
+                        )}
+                        <span className="ml-auto text-[10px]" style={{ color: S.textMuted }}>{fmtTime(c.resolved_at)}</span>
+                      </div>
+                      {/* Diff content (read-only) */}
+                      {c.action === "update" && (
+                        <div className="space-y-0.5">
+                          {c.old_content && c.old_content !== (c.proposed_content || c.new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>{c.old_content}</p>
+                          )}
+                          {(c.proposed_content || c.new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#4a9b6e" }}>{c.proposed_content || c.new_content}</p>
+                          )}
+                          {c.old_klass !== c.new_klass && c.old_klass && (
+                            <p className="text-[10px]" style={{ color: S.textMuted }}>分类: {c.old_klass} → {c.new_klass}</p>
+                          )}
+                          {c.old_disclosure !== c.new_disclosure && (c.old_disclosure || c.new_disclosure) && (
+                            <p className="text-[10px]" style={{ color: S.textMuted }}>触发: {c.old_disclosure || "无"} → {c.new_disclosure || "无"}</p>
+                          )}
+                        </div>
+                      )}
+                      {c.action === "delete" && c.old_content && (
+                        <p className="text-[10px] leading-relaxed" style={{ color: S.textMuted, textDecoration: "line-through" }}>{c.old_content}</p>
+                      )}
+                      {c.action === "merge" && (
+                        <div className="space-y-0.5">
+                          {c.old_content && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>#{c.memory_id}: {c.old_content}</p>
+                          )}
+                          {c.merge_target_old_content && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#b5454a", textDecoration: "line-through" }}>#{c.merge_into_id}: {c.merge_target_old_content}</p>
+                          )}
+                          {(c.proposed_content || c.merge_target_new_content) && (
+                            <p className="text-[10px] leading-relaxed" style={{ color: "#4a9b6e" }}>→ {c.proposed_content || c.merge_target_new_content}</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )
+            )}
+          </>
+        ) : (
+          /* ── Pending Memories View ── */
+          loading ? (
+            <div className="flex justify-center py-16">
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent" style={{ borderColor: `${S.accentDark} transparent ${S.accentDark} ${S.accentDark}` }} />
+            </div>
+          ) : items.length === 0 ? (
+            <p className="py-16 text-center text-[13px]" style={{ color: S.textMuted }}>没有待审的提取记忆</p>
+          ) : (
+            groups.map((group, gi) => (
+              <div key={gi}>
+                {group.summaryId && <SummaryDivider summaryId={group.summaryId} />}
+                {group.items.map((item) => (
+                  <PendingCard
+                    key={item.id}
+                    item={item}
+                    selected={selectedIds.has(item.id)}
+                    onToggle={() => toggleSelect(item.id)}
+                    onEdit={() => setEditing(item)}
+                    onEditRelated={(mem) => setEditingRelated(mem)}
+                    onOverwrite={(targetId) => {
+                      setDialog({
+                        type: "overwrite",
+                        title: "覆盖确认",
+                        message: `确定用这条提取记忆覆盖已有记忆 #${targetId} 吗？`,
+                        onConfirm: () => handleOverwrite(item.id, targetId),
+                      });
+                    }}
+                  />
+                ))}
+              </div>
+            ))
+          )
         )}
       </div>
 
       {/* Bottom bar */}
-      <div
-        className="flex shrink-0 gap-2 px-5 pb-5 pt-3"
-        style={{ background: S.bg, paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
-      >
+      {logView ? (
+        reflectTab === "pending" && pendingChanges.length > 0 ? (
+          <div
+            className="flex shrink-0 gap-2 px-5 pb-5 pt-3"
+            style={{ background: S.bg, paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
+          >
+            <button
+              className="flex-1 rounded-[14px] py-3 text-[14px] font-semibold"
+              style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: "#b5454a" }}
+              onClick={() => {
+                setDialog({
+                  type: "confirm", title: "全部拒绝", message: "确定拒绝所有待确认变更吗？",
+                  confirmLabel: "全部拒绝", confirmColor: "#b5454a",
+                  onConfirm: () => { setDialog(null); handleRejectAllPending(); },
+                });
+              }}
+            >
+              全部拒绝
+            </button>
+            <button
+              className="flex-1 rounded-[14px] py-3 text-[14px] font-semibold text-white"
+              style={{
+                background: "linear-gradient(135deg, var(--accent), var(--accent-dark))",
+                boxShadow: "4px 4px 10px rgba(201,98,138,0.35)",
+              }}
+              onClick={() => {
+                setDialog({
+                  type: "confirm", title: "全部确认", message: "确定确认所有待确认变更吗？",
+                  confirmLabel: "全部确认",
+                  onConfirm: () => { setDialog(null); handleConfirmAllPending(); },
+                });
+              }}
+            >
+              全部确认
+            </button>
+          </div>
+        ) : (
+          <div
+            className="shrink-0 px-5 pb-5 pt-3"
+            style={{ background: S.bg, paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
+          >
+            <button
+              className="w-full rounded-[14px] py-3 text-[14px] font-semibold text-white"
+              style={{
+                background: triggerBusy ? "#ccc" : "linear-gradient(135deg, var(--accent), var(--accent-dark))",
+                boxShadow: triggerBusy ? "none" : "4px 4px 10px rgba(201,98,138,0.35)",
+              }}
+              disabled={triggerBusy}
+              onClick={openReflectModal}
+            >
+              {triggerBusy ? "反思中..." : "手动触发反思"}
+            </button>
+          </div>
+        )
+      ) : (
+        <div
+          className="flex shrink-0 gap-2 px-5 pb-5 pt-3"
+          style={{ background: S.bg, paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
+        >
           {/* Select All 1/5 */}
           <button
             className="rounded-[14px] py-3 text-[13px] font-semibold"
@@ -501,14 +970,24 @@ export default function PendingMemories() {
           >
             保存{selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
           </button>
-      </div>
+        </div>
+      )}
 
-      {/* Edit modal */}
+      {/* Edit modal — pending memory */}
       {editing && (
         <EditModal
           item={editing}
           onSave={handleEdit}
           onCancel={() => setEditing(null)}
+        />
+      )}
+
+      {/* Edit modal — related (existing) memory */}
+      {editingRelated && (
+        <EditModal
+          item={editingRelated}
+          onSave={handleEditRelated}
+          onCancel={() => setEditingRelated(null)}
         />
       )}
 
@@ -522,6 +1001,112 @@ export default function PendingMemories() {
           onConfirm={dialog.onConfirm}
           onCancel={() => setDialog(null)}
         />
+      )}
+
+      {/* Edit pending change modal */}
+      {editingPending && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: "rgba(0,0,0,0.25)" }} onClick={() => setEditingPending(null)}>
+          <div className="mx-5 w-full max-w-[340px] rounded-[18px] p-4" style={{ background: S.bg, boxShadow: "0 8px 30px rgba(0,0,0,0.18)" }} onClick={(e) => e.stopPropagation()}>
+            <p className="mb-2 text-[13px] font-semibold" style={{ color: S.text }}>编辑提议内容</p>
+            <textarea
+              className="w-full rounded-[12px] p-3 text-[12px] leading-relaxed resize-none outline-none overflow-y-auto thin-scrollbar"
+              style={{ background: S.bg, boxShadow: "var(--inset-shadow)", color: S.text, minHeight: 100, maxHeight: 280 }}
+              value={editingPending.proposed_content}
+              onChange={(e) => setEditingPending({ ...editingPending, proposed_content: e.target.value })}
+              autoFocus
+            />
+            <div className="mt-3 flex gap-3">
+              <button className="flex-1 rounded-[12px] py-2 text-[12px] font-medium" style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.textMuted }} onClick={() => setEditingPending(null)}>取消</button>
+              <button
+                className="flex-1 rounded-[12px] py-2 text-[12px] font-medium"
+                style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.accentDark }}
+                onClick={() => handleEditPendingContent(editingPending.id, editingPending.proposed_content.trim())}
+                disabled={!editingPending.proposed_content.trim()}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reflection trigger modal */}
+      {reflectModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center" style={{ background: "rgba(0,0,0,0.35)" }} onClick={() => setReflectModal(false)}>
+          <div className="w-[85%] max-w-[340px] rounded-[18px] p-6" style={{ background: S.bg, boxShadow: "0 8px 30px rgba(0,0,0,0.18)" }} onClick={e => e.stopPropagation()}>
+            <h3 className="mb-4 text-center text-[16px] font-bold" style={{ color: S.text }}>手动触发反思</h3>
+            <p className="mb-3 text-center text-[13px]" style={{ color: S.textMuted }}>
+              选择范围（按时间排序，1 = 最早）
+            </p>
+            <div className="mb-2 flex items-center gap-2">
+              <input
+                type="number" min="1"
+                placeholder="起始"
+                value={reflectStart}
+                onChange={e => setReflectStart(e.target.value)}
+                className="rounded-[12px] border-none px-3 py-3 text-center text-[15px] outline-none"
+                style={{ flex: 1, minWidth: 0, background: "var(--card-bg, #f5f0f0)", color: S.text, boxShadow: "var(--inset-shadow)" }}
+              />
+              <span className="shrink-0 text-[14px]" style={{ color: S.textMuted }}>—</span>
+              <input
+                type="number" min="1"
+                placeholder="结束"
+                value={reflectEnd}
+                onChange={e => setReflectEnd(e.target.value)}
+                className="rounded-[12px] border-none px-3 py-3 text-center text-[15px] outline-none"
+                style={{ flex: 1, minWidth: 0, background: "var(--card-bg, #f5f0f0)", color: S.text, boxShadow: "var(--inset-shadow)" }}
+              />
+            </div>
+            <p className="mb-3 text-center text-[12px]" style={{ color: S.textMuted }}>
+              {totalMemories !== null ? `共 ${totalMemories} 条记忆 · ` : ""}不填则反思上次反思后的新记忆
+            </p>
+            <div className="mb-4 space-y-2">
+              <p className="text-[12px] font-medium" style={{ color: S.text }}>反思任务</p>
+              {[
+                { key: "disclosure", label: "补充 disclosure" },
+                { key: "merge", label: "重复合并" },
+                { key: "outdated", label: "过时信息更新" },
+                { key: "classify", label: "分类 + tags 修正" },
+              ].map(({ key, label }) => (
+                <label key={key} className="flex items-center gap-2 text-[13px] cursor-pointer" style={{ color: S.text }}>
+                  <span
+                    className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[5px]"
+                    style={{
+                      background: reflectTasks[key] ? "linear-gradient(135deg, var(--accent), var(--accent-dark))" : "var(--card-bg, #f5f0f0)",
+                      boxShadow: reflectTasks[key] ? "none" : "var(--inset-shadow)",
+                    }}
+                    onClick={() => setReflectTasks(prev => ({ ...prev, [key]: !prev[key] }))}
+                  >
+                    {reflectTasks[key] && <Check size={12} color="#fff" strokeWidth={3} />}
+                  </span>
+                  <span onClick={() => setReflectTasks(prev => ({ ...prev, [key]: !prev[key] }))}>{label}</span>
+                </label>
+              ))}
+            </div>
+            <div className="flex gap-3">
+              <button
+                className="flex-1 rounded-[12px] py-2.5 text-[14px] font-semibold"
+                style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.text }}
+                onClick={() => setReflectModal(false)}
+              >
+                取消
+              </button>
+              <button
+                className="flex-1 rounded-[12px] py-2.5 text-[14px] font-semibold text-white"
+                style={{ background: "linear-gradient(135deg, var(--accent), var(--accent-dark))", boxShadow: "4px 4px 10px rgba(201,98,138,0.35)" }}
+                onClick={triggerReflection}
+              >
+                确认
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {toast && (
+        <div className="fixed left-1/2 bottom-24 -translate-x-1/2 rounded-full px-4 py-2 text-[12px] font-medium shadow-lg z-50"
+          style={{ background: "rgba(0,0,0,0.75)", color: "#fff" }}>
+          {toast}
+        </div>
       )}
     </div>
   );

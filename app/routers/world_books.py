@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _sort_order_ensured = False
+_xml_tag_ensured = False
 
 
 def _ensure_sort_order_column(db: Session) -> None:
@@ -35,6 +36,23 @@ def _ensure_sort_order_column(db: Session) -> None:
     _sort_order_ensured = True
 
 
+def _ensure_xml_tag_column(db: Session) -> None:
+    global _xml_tag_ensured
+    if _xml_tag_ensured:
+        return
+    try:
+        db.execute(
+            text("ALTER TABLE world_books ADD COLUMN IF NOT EXISTS xml_tag VARCHAR(100)")
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    _xml_tag_ensured = True
+
+
 class WorldBookItem(BaseModel):
     id: int
     name: str
@@ -43,6 +61,7 @@ class WorldBookItem(BaseModel):
     keywords: list[Any] | None
     message_mode: str | None = None
     folder: str | None
+    xml_tag: str | None = None
     sort_order: int = 0
     created_at: str | None
 
@@ -59,6 +78,7 @@ class WorldBookCreateRequest(BaseModel):
     keywords: list[Any] | None = None
     message_mode: str | None = None
     folder: str | None = None
+    xml_tag: str | None = None
 
 
 class WorldBookUpdateRequest(BaseModel):
@@ -68,6 +88,7 @@ class WorldBookUpdateRequest(BaseModel):
     keywords: list[Any] | None = None
     message_mode: str | None = None
     folder: str | None = None
+    xml_tag: str | None = None
 
 
 class WorldBookDeleteResponse(BaseModel):
@@ -88,6 +109,7 @@ def _to_item(row: WorldBook) -> WorldBookItem:
         keywords=row.keywords or [],
         message_mode=row.message_mode,
         folder=row.folder,
+        xml_tag=getattr(row, "xml_tag", None),
         sort_order=row.sort_order if hasattr(row, "sort_order") else 0,
         created_at=format_datetime(row.created_at),
     )
@@ -100,6 +122,7 @@ def list_world_books(
     db: Session = Depends(get_db),
 ) -> WorldBooksResponse:
     _ensure_sort_order_column(db)
+    _ensure_xml_tag_column(db)
     query = db.query(WorldBook)
     total = query.count()
     rows = (
@@ -123,6 +146,7 @@ def create_world_book(
         keywords=payload.keywords or [],
         message_mode=payload.message_mode,
         folder=payload.folder,
+        xml_tag=payload.xml_tag,
     )
     db.add(row)
     db.commit()

@@ -17,6 +17,7 @@ class MaintenanceRunResponse(BaseModel):
     expired_cleaned: int
     similar_merged: int
     trash_cleaned: int
+    media_cleaned: int = 0
 
 
 @router.post("/maintenance/run", response_model=MaintenanceRunResponse)

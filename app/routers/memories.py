@@ -26,6 +26,7 @@ class MemoryItem(BaseModel):
     importance: float
     manual_boost: float
     hits: int
+    disclosure: str | None = None
     last_access_ts: str | None
     updated_at: str | None = None
     created_at: str | None
@@ -42,6 +43,7 @@ class MemoryUpdateRequest(BaseModel):
     manual_boost: float | None = None
     klass: str | None = None
     tags: dict | None = None
+    disclosure: str | None = None
 
 
 class MemoryDeleteResponse(BaseModel):
@@ -101,7 +103,11 @@ def list_memories(
     if source:
         query = query.filter(Memory.source == source)
     if search:
-        query = query.filter(Memory.content.ilike(f"%{search}%"))
+        from sqlalchemy import or_
+        conditions = [Memory.content.ilike(f"%{search}%")]
+        if search.isdigit():
+            conditions.append(Memory.id == int(search))
+        query = query.filter(or_(*conditions))
 
     total = query.count()
     rows = (
@@ -120,6 +126,7 @@ def list_memories(
             importance=row.importance,
             manual_boost=row.manual_boost,
             hits=row.hits,
+            disclosure=row.disclosure,
             last_access_ts=format_datetime(row.last_access_ts),
             updated_at=format_datetime(row.updated_at),
             created_at=format_datetime(row.created_at),
@@ -148,15 +155,45 @@ def update_memory(
         update_data = payload.model_dump(exclude_unset=True)
     else:
         update_data = payload.dict(exclude_unset=True)
+
+    # Snapshot before overwrite
+    from app.models.models import MemoryVersion
+    db.add(MemoryVersion(
+        memory_id=memory.id,
+        content=memory.content,
+        klass=memory.klass,
+        tags=memory.tags,
+        disclosure=memory.disclosure,
+        changed_by="admin",
+    ))
+
+    content_changed = False
     if "content" in update_data:
         memory.content = update_data["content"] or ""
+        content_changed = True
     if "manual_boost" in update_data:
         memory.manual_boost = update_data["manual_boost"] or 0.0
     if "klass" in update_data:
         memory.klass = update_data["klass"] or "other"
     if "tags" in update_data:
         memory.tags = update_data["tags"] or {}
+    if "disclosure" in update_data:
+        memory.disclosure = update_data.get("disclosure") or None
+        content_changed = True
     memory.updated_at = datetime.now(TZ_EAST8)
+
+    # Re-generate embedding if content or disclosure changed
+    if content_changed:
+        try:
+            from app.services.embedding_service import EmbeddingService
+            embed_text = memory.content
+            if memory.disclosure:
+                embed_text = f"{memory.disclosure}\n{embed_text}"
+            emb = EmbeddingService().get_embedding(embed_text)
+            if emb:
+                memory.embedding = emb
+        except Exception:
+            logger.warning("Failed to re-embed memory %d", memory_id, exc_info=True)
 
     db.commit()
     db.refresh(memory)
@@ -169,6 +206,7 @@ def update_memory(
         importance=memory.importance,
         manual_boost=memory.manual_boost,
         hits=memory.hits,
+        disclosure=memory.disclosure,
         last_access_ts=format_datetime(memory.last_access_ts),
         created_at=format_datetime(memory.created_at),
         decayed_score=_compute_decayed_score(memory),
@@ -203,6 +241,44 @@ def list_memory_trash(
     return TrashMemoriesResponse(memories=items, total=total)
 
 
+@router.get("/memories/{memory_id}/position")
+def get_memory_position(memory_id: int, db: Session = Depends(get_db)):
+    row = db.get(Memory, memory_id)
+    if not row or row.deleted_at:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    # Count how many memories appear before this one in default sort (created_at desc)
+    position = db.query(Memory).filter(
+        Memory.deleted_at.is_(None),
+        Memory.is_pending.is_(False),
+        (Memory.created_at > row.created_at) | (
+            (Memory.created_at == row.created_at) & (Memory.id > row.id)
+        ),
+    ).count()
+    return {"position": position, "id": memory_id}
+
+
+@router.get("/memories/{memory_id}", response_model=MemoryItem)
+def get_memory(memory_id: int, db: Session = Depends(get_db)) -> MemoryItem:
+    row = db.get(Memory, memory_id)
+    if not row or row.deleted_at:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return MemoryItem(
+        id=row.id,
+        content=row.content,
+        tags=row.tags or {},
+        source=row.source,
+        klass=row.klass,
+        importance=row.importance,
+        manual_boost=row.manual_boost,
+        hits=row.hits,
+        disclosure=row.disclosure,
+        last_access_ts=format_datetime(row.last_access_ts),
+        updated_at=format_datetime(row.updated_at),
+        created_at=format_datetime(row.created_at),
+        decayed_score=_compute_decayed_score(row),
+    )
+
+
 @router.post("/memories/{memory_id}/restore", response_model=MemoryDeleteResponse)
 def restore_memory(memory_id: int, db: Session = Depends(get_db)) -> MemoryDeleteResponse:
     memory = db.query(Memory).filter(Memory.id == memory_id).first()
@@ -213,6 +289,90 @@ def restore_memory(memory_id: int, db: Session = Depends(get_db)) -> MemoryDelet
     memory.deleted_at = None
     db.commit()
     return MemoryDeleteResponse(status="restored", id=memory_id)
+
+
+class MemoryVersionItem(BaseModel):
+    id: int
+    content: str
+    klass: str | None
+    tags: dict | None
+    disclosure: str | None
+    changed_by: str
+    created_at: str | None
+
+
+@router.get("/memories/{memory_id}/versions")
+def get_memory_versions(
+    memory_id: int,
+    db: Session = Depends(get_db),
+) -> list[MemoryVersionItem]:
+    from app.models.models import MemoryVersion
+    versions = (
+        db.query(MemoryVersion)
+        .filter(MemoryVersion.memory_id == memory_id)
+        .order_by(MemoryVersion.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        MemoryVersionItem(
+            id=v.id,
+            content=v.content,
+            klass=v.klass,
+            tags=v.tags,
+            disclosure=v.disclosure,
+            changed_by=v.changed_by,
+            created_at=format_datetime(v.created_at),
+        )
+        for v in versions
+    ]
+
+
+@router.post("/memories/{memory_id}/rollback/{version_id}")
+def rollback_memory(
+    memory_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+):
+    from app.models.models import MemoryVersion
+    memory = db.query(Memory).filter(Memory.id == memory_id, Memory.deleted_at.is_(None)).first()
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    version = db.query(MemoryVersion).filter(
+        MemoryVersion.id == version_id,
+        MemoryVersion.memory_id == memory_id,
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+    # Snapshot current state before rollback
+    db.add(MemoryVersion(
+        memory_id=memory.id,
+        content=memory.content,
+        klass=memory.klass,
+        tags=memory.tags,
+        disclosure=memory.disclosure,
+        changed_by="rollback",
+    ))
+    memory.content = version.content
+    memory.klass = version.klass or memory.klass
+    memory.tags = version.tags if version.tags is not None else memory.tags
+    memory.disclosure = version.disclosure
+    memory.updated_at = None
+
+    # Re-generate embedding for rolled-back content
+    try:
+        from app.services.embedding_service import EmbeddingService
+        embed_text = memory.content
+        if memory.disclosure:
+            embed_text = f"{memory.disclosure}\n{embed_text}"
+        emb = EmbeddingService().get_embedding(embed_text)
+        if emb:
+            memory.embedding = emb
+    except Exception:
+        logger.warning("Failed to re-embed memory %d on rollback", memory_id, exc_info=True)
+
+    db.commit()
+    return {"status": "rolled_back", "memory_id": memory_id, "to_version_id": version_id}
 
 
 class BatchDeleteRequest(BaseModel):

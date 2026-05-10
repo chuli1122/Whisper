@@ -27,6 +27,35 @@ async def send_private_msg(user_id: int, text: str) -> int | None:
         return data.get("message_id")
 
 
+async def send_group_msg(group_id: int, text: str, reply_to: int | None = None) -> int | None:
+    """Send a group text message. Optionally quote-reply to a message_id. Returns message_id or None."""
+    segments: list[dict] = []
+    if reply_to:
+        segments.append({"type": "reply", "data": {"id": str(reply_to)}})
+    segments.append({"type": "text", "data": {"text": text}})
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(f"{NAPCAT_API_URL}/send_group_msg", json={
+            "group_id": group_id,
+            "message": segments,
+        })
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        return data.get("message_id")
+
+
+async def send_group_voice(group_id: int, audio_bytes: bytes) -> int | None:
+    """Send a group voice message as base64-encoded record."""
+    b64 = base64.b64encode(audio_bytes).decode("ascii")
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(f"{NAPCAT_API_URL}/send_group_msg", json={
+            "group_id": group_id,
+            "message": [{"type": "record", "data": {"file": f"base64://{b64}"}}],
+        })
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        return data.get("message_id")
+
+
 async def send_private_voice(user_id: int, audio_bytes: bytes) -> int | None:
     """Send a voice message as base64-encoded record."""
     b64 = base64.b64encode(audio_bytes).decode("ascii")

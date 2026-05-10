@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -11,8 +12,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import Assistant, ChatSession, Message as MessageModel
+from app.models.models import Assistant, ChatSession, CotRecord, Message as MessageModel, Settings as SettingsModel
 from app.services.chat_service import ChatService
+from app.services.format_converters import _TOOL_CACHE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -44,8 +46,23 @@ class ChatCompletionResponse(BaseModel):
     messages: list[dict[str, Any]]
 
 
+
+def _strip_ts_prefix(s: str) -> str:
+    """Strip leading [YYYY.MM.DD HH:MM] timestamp prefix from memory content."""
+    if s.startswith("[") and "]" in s[:22]:
+        return s[s.index("]") + 1:].strip()
+    return s
+
+
 def _compress_tool_result(tool_name: str, content: str) -> str:
-    """Compress tool_result content into a short summary for context injection."""
+    """Compress small tool results into a short summary.
+
+    Results longer than _TOOL_CACHE_THRESHOLD are returned as-is
+    (extract_tool_cache will handle them later).
+    """
+    if len(content) > _TOOL_CACHE_THRESHOLD:
+        return content
+
     try:
         data = json.loads(content) if content else {}
     except (json.JSONDecodeError, TypeError):
@@ -59,94 +76,289 @@ def _compress_tool_result(tool_name: str, content: str) -> str:
 
     if tool_name == "save_memory":
         mid = data.get("id", "?")
-        c = str(data.get("content", ""))[:30]
+        c = _strip_ts_prefix(str(data.get("content", "")))[:15]
         if data.get("duplicate"):
             return f"[已存储记忆] 重复, existing_id={data.get('existing_id', '?')}"
         return f"[已存储记忆] id={mid}, {c}..."
 
     if tool_name == "update_memory":
-        mid = data.get("id", "?")
-        c = str(data.get("content", ""))[:30]
-        return f"[已更新记忆] id={mid}, {c}..."
-
-    if tool_name == "list_memories":
-        memories = data.get("memories", [])
-        ids = [str(m.get("id", "?")) for m in memories]
-        return f"[已列出记忆] 返回{len(memories)}条, ids=[{','.join(ids)}]"
-
-    if tool_name == "search_memory":
-        results = data.get("results", [])
-        query = data.get("query", "")
-        ids = [str(r.get("id", "?")) for r in results]
-        return f"[已搜索记忆] 关键词={query}, 返回{len(results)}条, ids=[{','.join(ids)}]"
+        c = _strip_ts_prefix(str(data.get("content", "")))[:15]
+        return f"[已更新记忆] id={data.get('id', '?')}, {c}..."
 
     if tool_name == "delete_memory":
-        mid = data.get("id", "?")
-        return f"[已删除记忆] id={mid}"
+        c = str(data.get("content", ""))
+        return f"[已删除记忆] id={data.get('id', '?')}, {c}"
 
+    if tool_name == "diary":
+        title = str(data.get("title", ""))[:15]
+        return f"[已写日记] id={data.get('id', '?')}, {title}"
+
+    if tool_name == "reminder":
+        if "reminders" in data or "pending_reminders" in data:
+            reminders = data.get("reminders") or data.get("pending_reminders", [])
+            if not reminders:
+                return "[提醒列表] 无"
+            lines = []
+            for r in reminders:
+                lines.append(f"id={r.get('id', '?')} {r.get('reason', '')} ({r.get('remaining_minutes', '?')}分钟后)")
+            return "[提醒列表] " + "; ".join(lines)
+        if data.get("id"):
+            reason = str(data.get("reason", ""))[:15]
+            return f"[已设置提醒] id={data.get('id', '?')}, {reason}"
+        return f"[闹钟] {data.get('message', data.get('status', ''))}"
+
+    if tool_name == "memo":
+        return f"[备忘录] {data.get('message', '')}"
+
+    # Legacy compatibility for old tool names in history
     if tool_name == "write_diary":
-        did = data.get("id", "?")
-        title = data.get("title", "")[:20]
-        return f"[已写日记] id={did}, {title}"
-
+        title = str(data.get("title", ""))[:15]
+        return f"[已写日记] id={data.get('id', '?')}, {title}"
     if tool_name == "read_diary":
-        if "diaries" in data:
-            diaries = data["diaries"]
-            ids = [str(d.get("id", "?")) for d in diaries]
-            return f"[已读日记列表] 返回{len(diaries)}条, ids=[{','.join(ids)}]"
-        did = data.get("id", "?")
-        title = data.get("title", "")[:20]
-        return f"[已读日记] id={did}, {title}"
-
-    if tool_name == "search_summary":
-        results = data.get("results", [])
-        query = data.get("query", "")
-        ids = [str(r.get("id", "?")) for r in results]
-        return f"[已搜索摘要] 关键词={query}, 返回{len(results)}条, ids=[{','.join(ids)}]"
-
-    if tool_name == "get_summary_by_id":
-        sid = data.get("id", "?")
-        sc = str(data.get("summary_content", ""))[:40]
-        return f"[已查看摘要] id={sid}, {sc}..."
-
-    if tool_name == "search_chat_history":
-        results = data.get("results", [])
-        query = data.get("query", "")
-        n = len(results)
-        return f"[已搜索聊天记录] 关键词={query}, 返回{n}条"
-
-    if tool_name == "search_theater":
-        results = data.get("results", [])
-        query = data.get("query", "")
-        return f"[已搜索小剧场] 关键词={query}, 返回{len(results)}条"
-
+        if data.get("diaries"):
+            return f"[日记列表] {data.get('total', '?')}篇"
+        if data.get("content"):
+            return f"[读日记] #{data.get('id', '?')} {data.get('title', '')}"
+        return content
+    if tool_name in ("set_reminder", "cancel_reminder", "list_reminders"):
+        if "reminders" in data or "pending_reminders" in data:
+            reminders = data.get("reminders") or data.get("pending_reminders", [])
+            if not reminders:
+                return "[提醒列表] 无"
+            lines = []
+            for r in reminders:
+                lines.append(f"id={r.get('id', '?')} {r.get('reason', '')} ({r.get('remaining_minutes', '?')}分钟后)")
+            return "[提醒列表] " + "; ".join(lines)
+        if data.get("id"):
+            return f"[已设置提醒] id={data.get('id', '?')}, {str(data.get('reason', ''))[:15]}"
+        return f"[闹钟] {data.get('message', data.get('status', ''))}"
     if tool_name == "web_search":
-        results = data.get("results", [])
-        query = data.get("query", "")
-        return f"[已搜索] query={query}, 返回{len(results)}条结果"
-
+        return f"[搜索] {data.get('query', '')}"
     if tool_name == "web_fetch":
-        title = data.get("title", "")
-        url = data.get("url", "")
-        return f"[已读取网页] url: {url} | title: {title}"
+        return f"[读取网页] {str(data.get('url', ''))[:40]}"
+    if tool_name in ("view_image", "view_file"):
+        return content
 
-    if tool_name == "run_bash":
-        output = data.get("output", "")
-        exit_code = data.get("exit_code", "?")
-        return f"[已执行命令] exit={exit_code}, {output[:60]}"
+    if tool_name == "get_memory_by_id":
+        c = str(data.get("content", ""))
+        klass = data.get("klass", "")
+        return f"[记忆#{data.get('id', '?')}] ({klass}) {c}"
 
-    if tool_name == "read_file":
-        path = data.get("path", "")
-        content = data.get("content", "")
-        return f"[已读取文件] {path}, {len(content)}字"
+    if tool_name in ("forum_cli", "forum_guide"):
+        result_text = data.get("result", "")
+        if result_text:
+            return result_text
+        return content
 
-    if tool_name == "write_file":
-        path = data.get("path", "")
-        written = data.get("bytes_written", "?")
-        return f"[已写入文件] {path}, {written}字节"
+    # Fallback: 未明确处理的工具，返回原始内容交给 extract_tool_cache
+    return content
 
-    # Fallback: tool_name + truncated content
-    return f"[{tool_name}] {str(data)[:60]}"
+
+def _expire_stale_tool_results(messages: list[dict[str, Any]], db: Session) -> int:
+    """Shrink old tool results (> configured hours) in the messages list.
+
+    Replaces content with `{_build_tool_index(...)} [已过期]` — same visual
+    format as the tool-cache-over-30k drop-oldest path. Operates on the returned
+    messages list only; DB content is preserved for UI history.
+
+    All tool types including cafe_chat follow the same time-based expiry.
+    Returns the number of messages replaced.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.services.format_converters import _build_tool_index
+
+    # Read expiry threshold from settings (default 24h)
+    row = db.query(SettingsModel).filter(SettingsModel.key == "tool_result_expire_hours").first()
+    try:
+        hours = int(row.value) if row and row.value else 24
+    except (ValueError, TypeError):
+        hours = 24
+    if hours <= 0:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    _EXCLUDED: set[str] = set()
+    replaced = 0
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        tool_name = msg.get("name") or (msg.get("meta_info") or {}).get("tool_name") or "unknown"
+        if tool_name in _EXCLUDED:
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content.startswith("{"):
+            # already compressed / short / expired
+            continue
+        created = msg.get("created_at")
+        if not created:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created > cutoff:
+            continue
+        index_text = _build_tool_index(tool_name, content, len(content))
+        msg["content"] = f"{index_text} [已过期]"
+        replaced += 1
+    return replaced
+
+
+def _inject_recent_scratchpad(messages: list[dict[str, Any]], db: Session) -> int:
+    """Inject scratchpad/thinking_fake content from cot_records back into recent
+    assistant messages, so the model has cross-request continuity for follow-ups
+    (esp. proactive flows where it needs to recall what it just did).
+
+    Cutoff = `tool_result_expire_hours` (default 24h, shared with tool expiry).
+    Older messages are not injected — keeps prompt bounded and avoids the
+    "model sees its own old draft and stops thinking" pollution.
+
+    For each unique request_id, all thinking_fake records (across rounds) are
+    concatenated and prepended (wrapped in <scratchpad>...</scratchpad>) to the
+    earliest assistant message of that request. DB content is not modified.
+    Returns number of assistant messages whose content was modified.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    row = db.query(SettingsModel).filter(SettingsModel.key == "tool_result_expire_hours").first()
+    try:
+        hours = int(row.value) if row and row.value else 24
+    except (ValueError, TypeError):
+        hours = 24
+    if hours <= 0:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    # Map request_id → ordered list of assistant messages (by created_at).
+    # Index in list corresponds to round_index.
+    rid_to_assistants: dict[str, list[dict[str, Any]]] = {}
+    recent_rids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        rid = msg.get("request_id")
+        if not rid:
+            continue
+        rid = str(rid)
+        created = msg.get("created_at")
+        if not created:
+            continue
+        if isinstance(created, datetime) and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < cutoff:
+            continue
+        recent_rids.add(rid)
+        rid_to_assistants.setdefault(rid, []).append(msg)
+
+    if not recent_rids:
+        return 0
+
+    # Batch fetch all thinking_fake records
+    rows = (
+        db.query(CotRecord)
+        .filter(
+            CotRecord.request_id.in_(list(recent_rids)),
+            CotRecord.block_type == "thinking_fake",
+        )
+        .order_by(CotRecord.request_id, CotRecord.round_index, CotRecord.id)
+        .all()
+    )
+    # Group by (request_id, round_index)
+    by_rid_round: dict[tuple[str, int], list[str]] = {}
+    for r in rows:
+        text = (r.content or "").strip()
+        if text:
+            by_rid_round.setdefault((r.request_id, r.round_index), []).append(text)
+
+    injected = 0
+    for (rid, round_idx), parts in by_rid_round.items():
+        assistants = rid_to_assistants.get(rid)
+        if not assistants or round_idx >= len(assistants):
+            continue
+        target = assistants[round_idx]
+        scratchpad_text = "\n---\n".join(parts).strip()
+        if not scratchpad_text:
+            continue
+        original = target.get("content")
+        scratchpad_block = f"<scratchpad>\n{scratchpad_text}\n</scratchpad>"
+        if isinstance(original, str):
+            target["content"] = f"{scratchpad_block}\n\n{original}".strip()
+        elif isinstance(original, list):
+            target["content"] = [{"type": "text", "text": scratchpad_block}] + original
+        else:
+            target["content"] = scratchpad_block
+        injected += 1
+    return injected
+
+
+
+def _reorder_after_request_anchor(db_msgs: list) -> list:
+    """Re-order user messages that arrived while a generation was running.
+    Those messages have meta.after_request_id set to the running request's id;
+    DB-id order would place them before the request's assistant reply (since
+    user rows are inserted immediately but assistant rows are persisted only
+    after the stream finishes). Move each such user message to sit after the
+    last message of its anchor request_id, so the model sees:
+        user(batch1) → assistant(R1 reply) → user(arrived during R1) → ...
+    instead of user(batch1+arrived-during-R1 merged) → assistant(R1)."""
+    pending_by_rid: dict[str, list] = {}
+    regular: list = []
+    for m in db_msgs:
+        meta = m.meta_info or {}
+        after_rid = meta.get("after_request_id")
+        if m.role == "user" and after_rid:
+            pending_by_rid.setdefault(after_rid, []).append(m)
+        else:
+            regular.append(m)
+    if not pending_by_rid:
+        return db_msgs
+    result: list = []
+    for i, m in enumerate(regular):
+        result.append(m)
+        curr_rid = m.request_id
+        if not curr_rid or curr_rid not in pending_by_rid:
+            continue
+        is_last_of_rid = (i + 1 >= len(regular)) or (regular[i + 1].request_id != curr_rid)
+        if is_last_of_rid:
+            result.extend(pending_by_rid.pop(curr_rid))
+    # Anchor request timed out or was summarized — strip after_request_id
+    # and insert by created_at so they stay in chronological position.
+    if pending_by_rid:
+        orphans = [m for msgs in pending_by_rid.values() for m in msgs]
+        for m in orphans:
+            if m.meta_info and "after_request_id" in m.meta_info:
+                m.meta_info = {k: v for k, v in m.meta_info.items() if k != "after_request_id"}
+        for orphan in orphans:
+            inserted = False
+            for j in range(len(result) - 1, -1, -1):
+                if hasattr(result[j], 'id') and hasattr(orphan, 'id') and result[j].id < orphan.id:
+                    result.insert(j + 1, orphan)
+                    inserted = True
+                    break
+            if not inserted:
+                result.insert(0, orphan)
+    return result
+
+
+_TZ8 = timezone(timedelta(hours=8))
+_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _inject_date_dividers(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Insert date divider pseudo-messages between messages on different days."""
+    result: list[dict[str, Any]] = []
+    prev_date: str | None = None
+    for msg in messages:
+        ca = msg.get("created_at")
+        if ca and isinstance(ca, datetime):
+            dt = ca.astimezone(_TZ8)
+            cur_date = dt.strftime("%Y-%m-%d")
+            if prev_date and cur_date != prev_date:
+                wd = _WEEKDAYS[dt.weekday()]
+                label = f"── {dt.month}月{dt.day}日（{wd}）──"
+                result.append({"role": "user", "content": label, "_date_divider": True})
+            prev_date = cur_date
+        result.append(msg)
+    return result
 
 
 def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]:
@@ -163,6 +375,7 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
         .order_by(MessageModel.id.asc())
         .all()
     )
+    db_msgs = _reorder_after_request_anchor(db_msgs)
     messages: list[dict[str, Any]] = [{"role": "system", "content": ""}]
     # Track tool_call_ids for matching tool results to their tool_use blocks
     pending_tc_ids: dict[str, list[str]] = {}  # tool_name → [tc_id, ...]
@@ -185,12 +398,27 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
                     "tool_calls": tc_list,
                     "id": m.id,
                     "created_at": m.created_at,
+                    "meta_info": meta,
+                    "request_id": m.request_id,
                 }
+                # Restore thinking blocks (signature only) for cross-request visibility
+                if "_thinking_blocks" in meta:
+                    msg_dict["_thinking_blocks"] = [
+                        {"type": b["type"], "thinking": "", "signature": b["signature"]}
+                        if b.get("type") == "thinking" and b.get("signature")
+                        else b
+                        for b in meta["_thinking_blocks"]
+                    ]
                 if _no_msg:
                     msg_dict["no_message"] = True
                 messages.append(msg_dict)
             elif "tool_call" in meta:
                 # Individual tool call record (redundant with bulk) — skip
+                pass
+            elif meta.get("cafe_reply") or meta.get("qq_group_reply"):
+                # UI-visible "[TG群回复] / [QQ群回复]" duplicates of the tool-call output.
+                # The model already sees the text via the tool_call payload, so skip
+                # here to avoid loading the same reply twice into history.
                 pass
             elif m.content and m.content.strip():
                 msg_dict = {
@@ -198,9 +426,18 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
                     "content": m.content,
                     "id": m.id,
                     "created_at": m.created_at,
+                    "meta_info": meta,
+                    "request_id": m.request_id,
                 }
                 if _no_msg:
                     msg_dict["no_message"] = True
+                if "_thinking_blocks" in meta:
+                    msg_dict["_thinking_blocks"] = [
+                        {"type": b["type"], "thinking": "", "signature": b["signature"]}
+                        if b.get("type") == "thinking" and b.get("signature")
+                        else b
+                        for b in meta["_thinking_blocks"]
+                    ]
                 messages.append(msg_dict)
             # Skip empty assistant messages
         elif m.role == "tool":
@@ -211,7 +448,7 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
             tool_call_id = meta.get("tool_call_id", "")
             if not tool_call_id and tool_name in pending_tc_ids and pending_tc_ids[tool_name]:
                 tool_call_id = pending_tc_ids[tool_name].pop(0)
-            compressed = _compress_tool_result(tool_name, m.content)
+            compressed = _compress_tool_result(tool_name, m.content or "")
             if tool_call_id:
                 # Proper tool result format — _oai_messages_to_anthropic converts to tool_result block
                 messages.append({
@@ -235,7 +472,7 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
                 messages.append(msg_dict)
         elif m.role == "system":
             messages.append({
-                "role": "assistant",
+                "role": "user",
                 "content": f"[系统通知] {m.content}",
                 "id": m.id,
                 "created_at": m.created_at,
@@ -303,6 +540,33 @@ def _load_session_messages(db: Session, session_id: int) -> list[dict[str, Any]]
         else:
             validated.append(msg)
             i += 1
+
+    # Expire old (>24h by default) tool results to keep context bounded
+    # when summarization hasn't kicked in for a while.
+    _n_expired = _expire_stale_tool_results(validated, db)
+    if _n_expired:
+        logger.info("[load] expired %d stale tool results", _n_expired)
+
+    # Inject recent (<24h) scratchpad / thinking_fake content from cot_records
+    # back into assistant messages, so the model has cross-request continuity
+    # for follow-up turns (esp. proactive). DB messages.content stays clean.
+    _n_injected = _inject_recent_scratchpad(validated, db)
+    if _n_injected:
+        logger.info("[load] injected scratchpad into %d assistant messages", _n_injected)
+
+    # Keep thinking blocks (signature) only on the most recent assistant message
+    _kept = 0
+    for _msg in reversed(validated):
+        if _msg.get("role") != "assistant":
+            continue
+        if "_thinking_blocks" not in _msg:
+            continue
+        _kept += 1
+        if _kept > 1:
+            del _msg["_thinking_blocks"]
+
+    # Inject date dividers between messages on different days
+    validated = _inject_date_dividers(validated)
 
     return validated
 

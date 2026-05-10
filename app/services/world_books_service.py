@@ -125,6 +125,11 @@ class WorldBooksService:
             if not content:
                 continue
 
+            # Wrap in XML if xml_tag is set
+            xml_tag = getattr(book, "xml_tag", None)
+            if xml_tag:
+                content = f'<{xml_tag} name="{book.name}">\n{content}\n</{xml_tag}>'
+
             position = m.position if m.position in ("before", "after") else "after"
             if position == "before":
                 before_entries.append((m.sort_order, content))

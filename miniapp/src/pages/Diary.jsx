@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronLeft, Trash2, Plus, X, Lock, Maximize2, Minimize2 } from "lucide-react";
+import { ChevronLeft, Trash2, Plus, X, Lock, Maximize2, Minimize2, Save, Pencil } from "lucide-react";
 import { apiFetch } from "../utils/api";
 import { getAvatar } from "../utils/db";
 
@@ -198,7 +198,7 @@ function AssistantPicker({ assistants, avatarMap, currentId, onSelect, onClose }
 /* ── Diary detail page (notebook style) ── */
 function DiaryDetail({ diary, onBack, onMarkRead }) {
   useEffect(() => {
-    if (diary && !diary.is_read && diary.author === "assistant") {
+    if (diary && (!diary.is_read || !diary.read_at) && diary.author === "assistant") {
       const unlocked = !diary.unlock_at || new Date(diary.unlock_at) <= new Date();
       if (unlocked) onMarkRead(diary.id);
     }
@@ -227,12 +227,19 @@ function DiaryDetail({ diary, onBack, onMarkRead }) {
   );
 }
 
-/* ── New diary form ── */
-function NewDiaryForm({ assistantId, onSave, onCancel }) {
-  const [title, setTitle] = useState("");
-  const [content, setContent] = useState("");
-  const [timed, setTimed] = useState(false);
-  const [unlockDate, setUnlockDate] = useState("");
+/* ── Diary form (new + edit) ── */
+function DiaryForm({ assistantId, editing, onSave, onCancel }) {
+  const [title, setTitle] = useState(editing?.title || "");
+  const [content, setContent] = useState(editing?.content || "");
+  const [timed, setTimed] = useState(!!editing?.unlock_at);
+  const [unlockDate, setUnlockDate] = useState(() => {
+    if (editing?.unlock_at) {
+      const d = new Date(editing.unlock_at);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    return "";
+  });
   const [saving, setSaving] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
@@ -240,9 +247,16 @@ function NewDiaryForm({ assistantId, onSave, onCancel }) {
     if (!content.trim() || saving) return;
     setSaving(true);
     try {
-      const body = { assistant_id: assistantId, author: "user", title: title.trim(), content: content.trim() };
-      if (timed && unlockDate) body.unlock_at = new Date(unlockDate).toISOString();
-      await onSave(body);
+      if (editing) {
+        const body = { title: title.trim(), content: content.trim() };
+        if (timed && unlockDate) body.unlock_at = new Date(unlockDate).toISOString();
+        else body.unlock_at = "";
+        await onSave(body, editing.id);
+      } else {
+        const body = { assistant_id: assistantId, author: "user", title: title.trim(), content: content.trim() };
+        if (timed && unlockDate) body.unlock_at = new Date(unlockDate).toISOString();
+        await onSave(body);
+      }
     } finally { setSaving(false); }
   };
 
@@ -252,11 +266,11 @@ function NewDiaryForm({ assistantId, onSave, onCancel }) {
         <button className="flex h-10 w-10 items-center justify-center rounded-full" style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }} onClick={onCancel}>
           <ChevronLeft size={22} style={{ color: S.text }} />
         </button>
-        <h1 className="text-[15px] font-bold" style={{ color: S.text }}>写日记</h1>
+        <h1 className="text-[15px] font-bold" style={{ color: S.text }}>{editing ? "编辑日记" : "写日记"}</h1>
         <button className="flex h-10 w-10 items-center justify-center rounded-full"
-          style={{ background: S.bg, boxShadow: content.trim() ? "var(--card-shadow-sm)" : "var(--inset-shadow)" }}
+          style={{ background: S.bg, boxShadow: saving ? "var(--inset-shadow)" : "var(--card-shadow-sm)" }}
           onClick={handleSave} disabled={!content.trim() || saving}>
-          <span className="text-[12px] font-bold" style={{ color: content.trim() ? S.accentDark : S.textMuted }}>存</span>
+          <Save size={18} style={{ color: S.accentDark }} />
         </button>
       </div>
       <div className="flex-1 overflow-y-auto px-5 pb-8">
@@ -338,6 +352,7 @@ export default function DiaryPage() {
   const [confirm, setConfirm] = useState(null);
   const [detail, setDetail] = useState(null);
   const [newForm, setNewForm] = useState(false);
+  const [editDiary, setEditDiary] = useState(null);
 
   // Load assistants + avatars
   useEffect(() => {
@@ -383,6 +398,8 @@ export default function DiaryPage() {
 
   const handleCreate = async (body) => { await apiFetch("/api/diary", { method: "POST", body }); setNewForm(false); loadDiaries(); };
 
+  const handleUpdate = async (body, id) => { await apiFetch(`/api/diary/${id}`, { method: "PUT", body }); setEditDiary(null); loadDiaries(); };
+
   const openDiary = (diary) => {
     const locked = diary.unlock_at && new Date(diary.unlock_at) > new Date();
     if (locked) return;
@@ -390,7 +407,8 @@ export default function DiaryPage() {
   };
 
   if (detail) return <DiaryDetail diary={detail} onBack={() => { setDetail(null); loadDiaries(); }} onMarkRead={markRead} />;
-  if (newForm) return <NewDiaryForm assistantId={assistantId} onSave={handleCreate} onCancel={() => setNewForm(false)} />;
+  if (editDiary) return <DiaryForm editing={editDiary} onSave={handleUpdate} onCancel={() => setEditDiary(null)} />;
+  if (newForm) return <DiaryForm assistantId={assistantId} onSave={handleCreate} onCancel={() => setNewForm(false)} />;
 
   return (
     <div className="flex h-full flex-col" style={{ background: S.bg }}>
@@ -447,7 +465,15 @@ export default function DiaryPage() {
                       )}
                       <span className="text-[13px] font-medium truncate" style={{ color: S.text }}>{diary.title || "无题"}</span>
                     </div>
-                    <span className="text-[10px] shrink-0 ml-2" style={{ color: S.textMuted }}>{fmtTime(diary.created_at)}</span>
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
+                      {diary.author === "user" && locked && (
+                        <button className="flex h-6 w-6 items-center justify-center rounded-full" style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                          onClick={(e) => { e.stopPropagation(); setEditDiary(diary); }}>
+                          <Pencil size={12} style={{ color: S.accentDark }} />
+                        </button>
+                      )}
+                      <span className="text-[10px]" style={{ color: S.textMuted }}>{fmtTime(diary.created_at)}</span>
+                    </div>
                   </div>
                   {locked ? (
                     <Countdown unlockAt={diary.unlock_at} />
@@ -455,6 +481,13 @@ export default function DiaryPage() {
                     <p className="text-[12px] leading-relaxed break-words" style={{ color: S.textMuted, maxHeight: 40, overflow: "hidden" }}>
                       {diary.content.length > 60 ? diary.content.slice(0, 60) + "..." : diary.content}
                     </p>
+                  )}
+                  {diary.author === "assistant" && diary.is_read && (
+                    <div className="flex justify-end mt-1">
+                      <span className="text-[10px]" style={{ color: "rgba(136,136,160,0.5)" }}>
+                        {diary.read_at ? `已读 ${fmtTime(diary.read_at)}` : "已读"}
+                      </span>
+                    </div>
                   )}
                 </div>
               </SwipeRow>

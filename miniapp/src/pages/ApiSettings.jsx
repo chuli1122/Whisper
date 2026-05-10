@@ -15,6 +15,7 @@ const S = {
 };
 
 const ANTHROPIC_MODELS = [
+  "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-opus-4-5-20251101",
   "claude-sonnet-4-6",
@@ -252,6 +253,64 @@ function Card({ children, className = "" }) {
   );
 }
 
+// ── OAuth URL field: disabled URL input with a provider picker dropdown ──
+function OAuthUrlField({ authType, baseUrl, onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+  return (
+    <div className="mb-4">
+      <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>
+        API 地址
+      </label>
+      <div className="relative" ref={ref}>
+        <input
+          type="text"
+          value={baseUrl}
+          disabled
+          className="w-full rounded-[14px] px-4 py-3 pr-10 text-[14px] outline-none"
+          style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+        />
+        <button
+          type="button"
+          className="absolute right-3 top-1/2 -translate-y-1/2"
+          onClick={() => setOpen(!open)}
+        >
+          <ChevronDown size={16} style={{ color: S.textMuted, transform: open ? "rotate(180deg)" : "none" }} />
+        </button>
+        {open && (
+          <div
+            className="absolute left-0 right-0 top-full z-40 mt-1 max-h-[200px] overflow-y-auto rounded-[14px]"
+            style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}
+          >
+            {[
+              { value: "oauth_claude", label: "Claude Code" },
+              { value: "oauth_codex", label: "OpenAI Codex" },
+            ].map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                className="flex w-full items-center justify-between px-4 py-2.5 text-left text-[13px]"
+                style={{ color: authType === opt.value ? S.accent : S.text }}
+                onClick={() => { onChange(opt.value); setOpen(false); }}
+              >
+                <span>{opt.label}</span>
+                {authType === opt.value ? <Check size={14} /> : null}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // ── Main ──
 export default function ApiSettings() {
   const navigate = useNavigate();
@@ -277,6 +336,9 @@ export default function ApiSettings() {
   // Thinking budget (per preset)
   const [thinkingBudget, setThinkingBudget] = useState(0);
 
+  // Thinking keyword (Claude Code magic keyword, OAuth only)
+  const [thinkingKeyword, setThinkingKeyword] = useState("");
+
   // UI
   const [toast, setToast] = useState(null);
   const [testingConnection, setTestingConnection] = useState(false);
@@ -292,11 +354,28 @@ export default function ApiSettings() {
   const pressStartPos = useRef(null);
 
   const formRef = useRef({});
-  formRef.current = { baseUrl, apiKey, authType, modelName, temperature, tempEnabled, topP, topPEnabled, maxTokens, thinkingBudget, editingPreset, providers };
+  formRef.current = { baseUrl, apiKey, authType, modelName, temperature, tempEnabled, topP, topPEnabled, maxTokens, thinkingBudget, thinkingKeyword, editingPreset, providers };
 
   const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2500);
+  }, []);
+
+  // Cache statuses per auth_type so switching the dropdown doesn't flicker
+  const [oauthStatusMap, setOauthStatusMap] = useState({});
+  const fetchOauthStatus = useCallback(async () => {
+    try {
+      const [claude, codex] = await Promise.all([
+        apiFetch(`/api/providers/oauth-status?auth_type=oauth_claude`).catch(() => null),
+        apiFetch(`/api/providers/oauth-status?auth_type=oauth_codex`).catch(() => null),
+      ]);
+      const map = {};
+      if (claude) map.oauth_claude = claude;
+      if (codex) map.oauth_codex = codex;
+      setOauthStatusMap(map);
+    } catch (e) {
+      console.error("[oauth-status] error", e);
+    }
   }, []);
 
   const fetchAll = useCallback(async () => {
@@ -307,14 +386,23 @@ export default function ApiSettings() {
       ]);
       setProviders(provRes.providers || []);
       setPresets(presRes.presets || []);
+      await fetchOauthStatus();
     } catch (e) {
       showToast("加载失败: " + e.message);
     } finally {
       setLoading(false);
     }
-  }, [showToast]);
+  }, [showToast, fetchOauthStatus]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // Persist the last-selected OAuth sub-provider so switching back to the
+  // OAuth segment restores the same provider across page reloads.
+  useEffect(() => {
+    if (authType === "oauth_claude" || authType === "oauth_codex") {
+      localStorage.setItem("last_oauth_provider", authType);
+    }
+  }, [authType]);
 
   const loadPreset = (preset) => {
     setEditingPreset(preset);
@@ -325,6 +413,7 @@ export default function ApiSettings() {
     setTopP(preset.top_p ?? 1.0);
     setMaxTokens(preset.max_tokens);
     setThinkingBudget(preset.thinking_budget || 0);
+    setThinkingKeyword(preset.thinking_keyword || "");
     const provider = providers.find((p) => p.id === preset.api_provider_id);
     if (provider) {
       setBaseUrl(provider.base_url);
@@ -345,6 +434,7 @@ export default function ApiSettings() {
     setTopPEnabled(false);
     setMaxTokens(4096);
     setThinkingBudget(0);
+    setThinkingKeyword("");
     setModelOptions([]);
   };
 
@@ -375,20 +465,31 @@ export default function ApiSettings() {
     setTestingConnection(true);
     try {
       const url = baseUrl.trim().replace(/\/+$/, "");
-      const hdrs = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey.trim()}`,
-      };
-      if (authType === "oauth_token") {
-        hdrs["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
-        hdrs["anthropic-dangerous-direct-browser-access"] = "true";
-        hdrs["x-app"] = "cli";
+      let endpoint, hdrs, body;
+      if (authType === "anthropic") {
+        const cleanBase = url.replace(/\/messages$/, "").replace(/\/v1$/, "");
+        endpoint = `${cleanBase}/v1/messages`;
+        hdrs = {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        };
+        body = JSON.stringify({ model: modelName.trim(), max_tokens: 10, messages: [{ role: "user", content: "Hi" }] });
+      } else {
+        endpoint = `${url}/chat/completions`;
+        hdrs = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey.trim()}`,
+        };
+        if (authType === "oauth_claude") {
+          hdrs["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
+          hdrs["anthropic-dangerous-direct-browser-access"] = "true";
+          hdrs["x-app"] = "cli";
+        }
+        body = JSON.stringify({ model: modelName.trim(), max_tokens: 10, messages: [{ role: "user", content: "Hi" }] });
       }
-      const res = await fetch(`${url}/chat/completions`, {
-        method: "POST",
-        headers: hdrs,
-        body: JSON.stringify({ model: modelName.trim(), max_tokens: 10, messages: [{ role: "user", content: "Hi" }] }),
-      });
+      const res = await fetch(endpoint, { method: "POST", headers: hdrs, body });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error?.message || `HTTP ${res.status}`);
@@ -406,23 +507,35 @@ export default function ApiSettings() {
     const url = f.baseUrl.trim();
     const key = f.apiKey.trim();
     const at = f.authType;
+    const isOauth = at === "oauth_claude" || at === "oauth_codex";
     const existing = currentProviders.find((p) => p.base_url === url);
     if (existing) {
-      if (existing.api_key !== key || existing.auth_type !== at) {
-        await apiFetch(`/api/providers/${existing.id}`, { method: "PUT", body: { api_key: key, auth_type: at } });
+      const body = {};
+      if (existing.auth_type !== at) body.auth_type = at;
+      // For OAuth flows, never overwrite api_key from the UI — it's the
+      // access_token maintained by oauth_helper's refresh loop.
+      if (!isOauth && existing.api_key !== key) body.api_key = key;
+      if (Object.keys(body).length > 0) {
+        await apiFetch(`/api/providers/${existing.id}`, { method: "PUT", body });
       }
       return existing.id;
     }
     const res = await apiFetch("/api/providers", {
       method: "POST",
-      body: { name: domainFromUrl(url), base_url: url, api_key: key, auth_type: at },
+      body: {
+        name: domainFromUrl(url),
+        base_url: url,
+        api_key: isOauth ? "" : key,
+        auth_type: at,
+      },
     });
     return res.id;
   };
 
   const doSave = async (name, asNew) => {
     const f = formRef.current;
-    if (!f.baseUrl.trim() || !f.apiKey.trim() || !f.modelName.trim()) {
+    const isOauthFlow = f.authType === "oauth_claude" || f.authType === "oauth_codex";
+    if (!f.baseUrl.trim() || !f.modelName.trim() || (!isOauthFlow && !f.apiKey.trim())) {
       showToast("请填写完整信息"); return;
     }
     setSaving(true);
@@ -435,6 +548,7 @@ export default function ApiSettings() {
         top_p: f.topPEnabled ? f.topP : null,
         max_tokens: Number(f.maxTokens) || 4096,
         thinking_budget: Number(f.thinkingBudget) || 0,
+        thinking_keyword: f.thinkingKeyword || null,
         api_provider_id: providerId,
       };
       if (f.editingPreset && !asNew) {
@@ -534,16 +648,59 @@ export default function ApiSettings() {
           <>
             {/* Connection */}
             <Card>
-              <NmInput label="API 地址" value={baseUrl} onChange={setBaseUrl} placeholder="https://api.openai.com/v1" disabled={authType === "oauth_token"} />
-              <NmInput label="API Key" value={apiKey} onChange={setApiKey} placeholder={authType === "oauth_token" ? "<oauth-token>" : "<api-key>"} password />
+              {authType === "oauth_claude" || authType === "oauth_codex" ? (
+                <OAuthUrlField
+                  authType={authType}
+                  baseUrl={baseUrl}
+                  onChange={(at) => {
+                    setAuthType(at);
+                    if (at === "oauth_claude") setBaseUrl("https://api.anthropic.com/v1");
+                    else if (at === "oauth_codex") setBaseUrl("https://chatgpt.com/backend-api/codex");
+                  }}
+                />
+              ) : (
+                <NmInput
+                  label="API 地址"
+                  value={baseUrl}
+                  onChange={setBaseUrl}
+                  placeholder={authType === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"}
+                />
+              )}
+              <NmInput
+                label={authType === "oauth_claude" || authType === "oauth_codex" ? "TOKEN（自动刷新）" : "API Key"}
+                value={(authType === "oauth_claude" || authType === "oauth_codex") ? (oauthStatusMap[authType]?.expires_at ? (() => {
+                  const st = oauthStatusMap[authType];
+                  const sec = st.seconds_left;
+                  const h = Math.floor(sec / 3600);
+                  const m = Math.floor((sec % 3600) / 60);
+                  const expireDate = new Date(st.expires_at * 1000);
+                  const expireStr = expireDate.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+                  return `${st.refreshing ? "刷新中… · " : ""}${h > 0 ? `${h}h ${m}m` : `${m}m`} 后过期 · ${expireStr}`;
+                })() : "发一条消息后显示") : apiKey}
+                onChange={setApiKey}
+                placeholder="<api-key>"
+                password={authType === "api_key" || authType === "anthropic"}
+                disabled={authType === "oauth_claude" || authType === "oauth_codex"}
+              />
+
               <div>
                 <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>认证方式</label>
                 <SegmentControl
-                  value={authType}
-                  onChange={(v) => { setAuthType(v); if (v === "oauth_token") setBaseUrl("https://api.anthropic.com/v1"); }}
+                  value={authType === "oauth_claude" || authType === "oauth_codex" ? "oauth" : authType}
+                  onChange={(v) => {
+                    if (v === "oauth") {
+                      const last = localStorage.getItem("last_oauth_provider") || "oauth_claude";
+                      setAuthType(last);
+                      if (last === "oauth_codex") setBaseUrl("https://chatgpt.com/backend-api/codex");
+                      else setBaseUrl("https://api.anthropic.com/v1");
+                    } else {
+                      setAuthType(v);
+                    }
+                  }}
                   options={[
-                    { value: "api_key", label: "标准 API Key" },
-                    { value: "oauth_token", label: "Setup Token" },
+                    { value: "api_key", label: "OpenAI" },
+                    { value: "anthropic", label: "Anthropic" },
+                    { value: "oauth", label: "OAuth" },
                   ]}
                 />
               </div>
@@ -553,8 +710,17 @@ export default function ApiSettings() {
             <Card>
               <div>
                 <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>模型名称</label>
-                {authType === "oauth_token" ? (
+                {authType === "oauth_claude" || authType === "anthropic" ? (
                   <AnthropicModelInput value={modelName} onChange={setModelName} />
+                ) : authType === "oauth_codex" ? (
+                  <input
+                    type="text"
+                    placeholder="gpt-5.5 / gpt-5.4 …"
+                    value={modelName}
+                    onChange={(e) => setModelName(e.target.value)}
+                    className="w-full rounded-[14px] px-4 py-3 text-[14px] outline-none"
+                    style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                  />
                 ) : (
                   <ModelDropdown value={modelName} onChange={setModelName} options={modelOptions} />
                 )}
@@ -571,9 +737,9 @@ export default function ApiSettings() {
                 </button>
                 <button
                   className="flex flex-1 items-center justify-center gap-2 rounded-[14px] py-3 text-[13px] font-semibold"
-                  style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.text, opacity: authType === "oauth_token" ? 0.4 : 1 }}
+                  style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)", color: S.text, opacity: authType === "api_key" ? 1 : 0.4 }}
                   onClick={handleFetchModels}
-                  disabled={fetchingModels || authType === "oauth_token"}
+                  disabled={fetchingModels || authType !== "api_key"}
                 >
                   {fetchingModels ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
                   拉取模型
@@ -619,17 +785,55 @@ export default function ApiSettings() {
                   <div className="text-[11px]" style={{ color: S.textMuted }}>Extended Thinking tokens</div>
                 </div>
                 <select
-                  className="w-20 rounded-[10px] py-2 text-center text-[13px] font-bold outline-none appearance-none"
+                  className="w-32 rounded-[10px] py-2 text-center text-[13px] font-bold outline-none appearance-none"
                   style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text, WebkitAppearance: "none", textAlignLast: "center" }}
                   value={thinkingBudget}
                   onChange={(e) => setThinkingBudget(Number(e.target.value))}
                 >
-                  <option value={0}>关闭</option>
-                  <option value={1024}>1024</option>
-                  <option value={2048}>2048</option>
-                  <option value={4096}>4096</option>
-                  <option value={8192}>8192</option>
-                  <option value={16384}>16384</option>
+                  {authType === "oauth_codex" || (authType === "api_key" && baseUrl.includes("deepseek.com")) ? (
+                    <>
+                      <option value={0}>关闭</option>
+                      <option value={1024}>low</option>
+                      <option value={2048}>medium</option>
+                      <option value={4096}>high</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value={0}>关闭</option>
+                      <option value={1024}>1024 (low)</option>
+                      <option value={2048}>2048 (medium)</option>
+                      <option value={4096}>4096 (high)</option>
+                      <option value={8192}>8192 (xhigh)</option>
+                      <option value={16384}>16384 (max)</option>
+                    </>
+                  )}
+                </select>
+              </div>
+              <div className="h-px" style={{ background: "rgba(136,136,160,0.15)" }} />
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[14px] font-semibold" style={{ color: authType === "oauth_claude" ? S.text : S.textMuted }}>思考关键词</div>
+                  <div className="text-[11px]" style={{ color: S.textMuted }}>仅 OAuth 路径 · 追加到 user 消息末尾</div>
+                </div>
+                <select
+                  className="w-32 rounded-[10px] py-2 text-center text-[13px] font-bold outline-none appearance-none"
+                  style={{
+                    boxShadow: "var(--inset-shadow)",
+                    background: S.bg,
+                    color: authType === "oauth_claude" ? S.text : S.textMuted,
+                    opacity: authType === "oauth_claude" ? 1 : 0.5,
+                    WebkitAppearance: "none",
+                    textAlignLast: "center",
+                  }}
+                  value={thinkingKeyword}
+                  onChange={(e) => setThinkingKeyword(e.target.value)}
+                  disabled={authType !== "oauth_claude"}
+                >
+                  <option value="">关闭</option>
+                  <option value="think">think (≈4k)</option>
+                  <option value="think hard">think hard (≈10k)</option>
+                  <option value="think harder">think harder (≈32k)</option>
+                  <option value="ultrathink">ultrathink (≈32k)</option>
                 </select>
               </div>
             </Card>
@@ -708,7 +912,7 @@ export default function ApiSettings() {
                         <div className="text-[14px] font-bold truncate" style={{ color: editingPreset?.id === p.id ? S.accentDark : S.text }}>
                           {p.name}
                         </div>
-                        <Pencil size={12} style={{ color: S.textMuted, flexShrink: 0, marginLeft: 8 }} />
+                        <Pencil size={12} style={{ color: S.textMuted, flexShrink: 0, marginLeft: 8, cursor: "pointer" }} onClick={(e) => { e.stopPropagation(); setRenameTarget(p); setRenameValue(p.name); }} />
                       </div>
                       <div className="mt-0.5 truncate text-[11px]" style={{ color: S.textMuted }}>{p.model_name}</div>
                       <div className="mt-1 text-[10px] font-mono" style={{ color: S.textMuted }}>

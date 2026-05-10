@@ -16,8 +16,8 @@ router = APIRouter()
 
 DEFAULT_DIALOGUE_RETAIN_BUDGET = 8000
 DEFAULT_DIALOGUE_TRIGGER_THRESHOLD = 16000
-DEFAULT_SUMMARY_BUDGET_LONGTERM = 800
-DEFAULT_SUMMARY_BUDGET_DAILY = 800
+DEFAULT_SUMMARY_BUDGET_LONGTERM = 2000
+DEFAULT_SUMMARY_BUDGET_DAILY = 2000
 DEFAULT_SUMMARY_BUDGET_RECENT = 2000
 DEFAULT_GROUP_CHAT_WAIT_SECONDS = 5
 DEFAULT_GROUP_CHAT_MAX_TOKENS = 600
@@ -212,8 +212,8 @@ def update_chat_mode(
 
     # Insert system message, similar to mood switch
     MODE_SWITCH_MESSAGES = {
-        "long": "[环境切换] 当前平台：Telegram（长消息模式）。\n注意：从这条消息开始按以下要求输出，不要模仿上文的风格。\n要求：完整段落输出，不拆条，不使用[NEXT]，每次回复至少3段，说话用双引号包裹（如\"我想你了。\"），动作描写和语言自然穿插交织在同一段内，段落要有体量。回复正文中一律使用第二人称\"你\"称呼对方，不许用\"她\"。",
-        "short": "[环境切换] 当前平台：QQ（短消息模式）。\n注意：从这条消息开始按以下要求输出，不要模仿上文的风格。\n要求：像真人发微信一样自然回复，用[NEXT]拆条，不使用空行分段，不使用动作描写。",
+        "long": "[环境切换] 当前平台：Telegram（长消息模式）。\n注意：从本条消息起严格按以下规则输出，不再沿用之前的回复风格。\n要求：采用第一视角叙事，仅描述自身动作、神态与状态；说话内容用双引号包裹，与动作、神态自然交织为完整段落。不拆条、不使用[NEXT]，回复需连贯饱满。内心情绪通过动作与语气含蓄表达，不使用直白心理旁白。回复中统一使用第二人称\"你\"称呼对方，禁止使用\"她\"。",
+        "short": "[环境切换] 当前平台：QQ（短消息模式）。\n注意：从本条消息起严格按以下规则输出，不再沿用之前的回复风格。\n要求：采用日常短消息表达习惯，语气轻松自然；无动作描写，语句以逗号或空格分隔，可使用[NEXT]拆条，不使用空行分段。整体追求流畅真实的聊天质感，避免生硬书面化。",
     }
     switch_content = MODE_SWITCH_MESSAGES.get(mode, f"已切换到{mode}模式")
     latest_session = (
@@ -308,6 +308,59 @@ def update_max_tool_rounds(
     _upsert_setting(db, "max_tool_rounds", str(rounds))
     db.commit()
     return MaxToolRoundsResponse(max_rounds=rounds)
+
+
+# ── Tool result expire hours ─────────────────────────────────────────────────
+
+class ToolResultExpireResponse(BaseModel):
+    hours: int
+
+
+class ToolResultExpireUpdateRequest(BaseModel):
+    hours: int = Field(..., ge=1, le=168)
+
+
+@router.get("/settings/tool-result-expire-hours", response_model=ToolResultExpireResponse)
+def get_tool_result_expire_hours(db: Session = Depends(get_db)) -> ToolResultExpireResponse:
+    row = db.query(Settings).filter(Settings.key == "tool_result_expire_hours").first()
+    return ToolResultExpireResponse(hours=int(row.value) if row else 24)
+
+
+@router.put("/settings/tool-result-expire-hours", response_model=ToolResultExpireResponse)
+def update_tool_result_expire_hours(
+    payload: ToolResultExpireUpdateRequest,
+    db: Session = Depends(get_db),
+) -> ToolResultExpireResponse:
+    h = max(1, min(168, payload.hours))
+    _upsert_setting(db, "tool_result_expire_hours", str(h))
+    db.commit()
+    return ToolResultExpireResponse(hours=h)
+
+
+# ── Model Memo (global aicheng memo) ─────────────────────────────────────────
+
+class ModelMemoResponse(BaseModel):
+    memo: str
+
+
+class ModelMemoUpdateRequest(BaseModel):
+    memo: str
+
+
+@router.get("/settings/model-memo", response_model=ModelMemoResponse)
+def get_model_memo(db: Session = Depends(get_db)) -> ModelMemoResponse:
+    row = db.query(Settings).filter(Settings.key == "model_memo").first()
+    return ModelMemoResponse(memo=row.value if row else "")
+
+
+@router.put("/settings/model-memo", response_model=ModelMemoResponse)
+def update_model_memo(
+    payload: ModelMemoUpdateRequest,
+    db: Session = Depends(get_db),
+) -> ModelMemoResponse:
+    _upsert_setting(db, "model_memo", payload.memo)
+    db.commit()
+    return ModelMemoResponse(memo=payload.memo)
 
 
 # ── Mood ─────────────────────────────────────────────────────────────────────
@@ -545,6 +598,7 @@ class SummaryLayerItem(BaseModel):
     version: int = 1
     pending_ids: list[int] = []
     pending_daily: list[PendingDailyGroup] = []
+    needs_merge: bool = False
 
 
 class SummaryLayersResponse(BaseModel):
@@ -618,6 +672,7 @@ def get_summary_layers(db: Session = Depends(get_db)) -> SummaryLayersResponse:
                 version=row.version,
                 pending_ids=raw_pending_ids,
                 pending_daily=pending_daily,
+                needs_merge=row.needs_merge,
             )
         return SummaryLayerItem(
             content="", updated_at=None,
@@ -764,13 +819,16 @@ def rollback_summary_layer(
     # 2. Delete the target history entry (it becomes the current version)
     db.delete(history)
 
-    # 3. Restore to target version
+    # 3. Restore content AND version (history.version has no unique constraint,
+    # so reverting the version number doesn't conflict with the just-saved snapshot)
     row.content = target_content
     row.version = target_version
     row.needs_merge = False
     row.updated_at = datetime.now(TZ_EAST8)
 
-    # 4. Release summaries: keep merged_into (option C), only clear merged_at_version
+    # 4. Release summaries merged after the target version — clear both
+    # merged_at_version AND merged_into so they return to the unmerged pool
+    # (front-end stops showing "已归档" tag).
     released = (
         db.query(SessionSummary)
         .filter(
@@ -783,10 +841,8 @@ def rollback_summary_layer(
     released_ids = []
     for s in released:
         s.merged_at_version = None
+        s.merged_into = None
         released_ids.append(s.id)
-
-    if released_ids:
-        row.needs_merge = True
 
     db.commit()
     logger.info(
@@ -881,13 +937,9 @@ def flush_summaries_to_layers(force: bool = False, db: Session = Depends(get_db)
     def _estimate_tokens(text: str) -> int:
         return max(1, len(text) * 2 // 3)
 
-    # Step 1: flush un-merged overflow summaries into layers (per assistant)
+    # Step 1: flush un-merged overflow summaries into daily (per assistant)
     flushed = 0
-    to_daily = 0
-    to_longterm = 0
     svc = SummaryService(SessionLocal)
-    TZ_EAST8 = timezone(timedelta(hours=8))
-    _today = datetime.now(TZ_EAST8).date()
 
     for assistant in assistants:
         all_summaries = (
@@ -912,31 +964,12 @@ def flush_summaries_to_layers(force: bool = False, db: Session = Depends(get_db)
             elif s.merged_into is None:
                 overflow.append(s)
 
-        a_to_daily = 0
-        a_to_longterm = 0
         for s in overflow:
-            s_date = s.time_end or s.created_at
-            if s_date:
-                if s_date.tzinfo is None:
-                    s_date = s_date.replace(tzinfo=TZ_EAST8)
-                s_date = s_date.astimezone(TZ_EAST8).date()
-            else:
-                s_date = _today
-            if s_date == _today:
-                s.merged_into = "daily"
-                a_to_daily += 1
-            else:
-                s.merged_into = "longterm"
-                a_to_longterm += 1
+            s.merged_into = "daily"
             flushed += 1
-        to_daily += a_to_daily
-        to_longterm += a_to_longterm
 
-        # Ensure layer rows exist and are marked for merge
-        if a_to_daily > 0:
+        if overflow:
             svc.ensure_layer_needs_merge(db, assistant.id, "daily")
-        if a_to_longterm > 0:
-            svc.ensure_layer_needs_merge(db, assistant.id, "longterm")
     if flushed:
         db.commit()
 
@@ -966,6 +999,267 @@ def flush_summaries_to_layers(force: bool = False, db: Session = Depends(get_db)
             ).start()
 
     return {
-        "flushed": flushed, "to_daily": to_daily, "to_longterm": to_longterm,
+        "flushed": flushed, "to_daily": flushed,
         "merge_triggered": merged_layers,
     }
+
+
+# ── Weekly merge info ────────────────────────────────────────────────────────
+
+MERGE_INTERVAL_DAYS = 7
+
+
+@router.get("/settings/merge-info")
+def get_merge_info(db: Session = Depends(get_db)):
+    """Return next weekly merge date, days/hours/minutes remaining, and total remaining_seconds."""
+    row = db.query(Settings).filter(Settings.key == "last_weekly_merge").first()
+    if row:
+        last_merge = datetime.fromisoformat(row.value).date()
+    else:
+        last_merge = datetime.now(TZ_EAST8).date()
+    next_merge = last_merge + timedelta(days=MERGE_INTERVAL_DAYS)
+    now_bj = datetime.now(TZ_EAST8)
+    next_merge_dt = datetime.combine(next_merge, datetime.min.time()).replace(tzinfo=TZ_EAST8)
+    remaining = next_merge_dt - now_bj
+    remaining_seconds = max(0, int(remaining.total_seconds()))
+    days_left = remaining_seconds // 86400
+    hours_left = (remaining_seconds % 86400) // 3600
+    minutes_left = (remaining_seconds % 3600) // 60
+    return {
+        "last_merge": last_merge.isoformat(),
+        "next_merge": next_merge.isoformat(),
+        "days_left": days_left,
+        "hours_left": hours_left,
+        "minutes_left": minutes_left,
+        "remaining_seconds": remaining_seconds,
+        "interval_days": MERGE_INTERVAL_DAYS,
+    }
+
+
+# ── Archive only (no merge) ─────────────────────────────────────────────────
+
+@router.post("/settings/summary-layers/archive")
+def archive_overflow(db: Session = Depends(get_db)):
+    """Archive overflow summaries into daily layer without triggering merge."""
+    from app.database import SessionLocal
+    from app.models.models import Assistant
+    from app.services.summary_service import SummaryService
+
+    assistants = db.query(Assistant).filter(Assistant.deleted_at.is_(None)).all()
+    if not assistants:
+        raise HTTPException(status_code=404, detail="No assistant found")
+
+    budget_key = "summary_budget_recent"
+    budget_row = db.query(Settings).filter(Settings.key == budget_key).first()
+    budget_recent = int(budget_row.value) if budget_row else DEFAULT_SUMMARY_BUDGET_RECENT
+
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) * 2 // 3)
+
+    flushed = 0
+    svc = SummaryService(SessionLocal)
+
+    for assistant in assistants:
+        all_summaries = (
+            db.query(SessionSummary)
+            .filter(
+                SessionSummary.assistant_id == assistant.id,
+                SessionSummary.deleted_at.is_(None),
+                SessionSummary.msg_id_start.isnot(None),
+            )
+            .order_by(SessionSummary.created_at.desc())
+            .all()
+        )
+        used = 0
+        overflow: list[SessionSummary] = []
+        for s in all_summaries:
+            content = (s.summary_content or "").strip()
+            if not content:
+                continue
+            tokens = _estimate_tokens(content)
+            if used + tokens <= budget_recent:
+                used += tokens
+            elif s.merged_into is None:
+                overflow.append(s)
+
+        for s in overflow:
+            s.merged_into = "daily"
+            flushed += 1
+
+        if overflow:
+            svc.ensure_layer_needs_merge(db, assistant.id, "daily")
+    if flushed:
+        db.commit()
+
+    return {"flushed": flushed}
+
+
+# ── Merge daily layer ────────────────────────────────────────────────────────
+
+@router.post("/settings/summary-layers/merge-daily")
+def merge_daily(db: Session = Depends(get_db)):
+    """Trigger merge of daily layer (only if it needs merge)."""
+    import threading
+    from app.database import SessionLocal
+    from app.models.models import Assistant
+    from app.services.summary_service import SummaryService
+
+    assistants = db.query(Assistant).filter(Assistant.deleted_at.is_(None)).all()
+    svc = SummaryService(SessionLocal)
+    triggered = False
+
+    for assistant in assistants:
+        layer = (
+            db.query(SummaryLayer)
+            .filter(
+                SummaryLayer.assistant_id == assistant.id,
+                SummaryLayer.layer_type == "daily",
+            )
+            .first()
+        )
+        if layer and layer.needs_merge:
+            triggered = True
+            threading.Thread(
+                target=svc.merge_layers_async, args=(assistant.id, ("daily",)), daemon=True,
+            ).start()
+
+    return {"triggered": triggered}
+
+
+# ── Merge daily → longterm (manual early merge) ─────────────────────────────
+
+@router.post("/settings/summary-layers/merge-to-longterm")
+def merge_to_longterm(db: Session = Depends(get_db)):
+    """Manually trigger daily→longterm merge and reset the weekly countdown."""
+    import threading
+    from app.database import SessionLocal
+    from app.models.models import Assistant
+    from app.services.summary_service import SummaryService
+
+    assistants = db.query(Assistant).filter(Assistant.deleted_at.is_(None)).all()
+    if not assistants:
+        raise HTTPException(status_code=404, detail="No assistant found")
+
+    svc = SummaryService(SessionLocal)
+
+    def _worker(aid: int):
+        svc.daily_merge_to_longterm(aid)
+
+    for assistant in assistants:
+        threading.Thread(target=_worker, args=(assistant.id,), daemon=True).start()
+
+    # Update last_weekly_merge to now (optimistic — merge runs in background)
+    now_str = datetime.now(TZ_EAST8).date().isoformat()
+    row = db.query(Settings).filter(Settings.key == "last_weekly_merge").first()
+    if row:
+        row.value = now_str
+    else:
+        db.add(Settings(key="last_weekly_merge", value=now_str))
+    db.commit()
+
+    return get_merge_info(db)
+
+
+# ── Prompt management ──
+# The 6 editable prompt blocks used on the message side. Defaults live in
+# chat_service.py / proactive_service.py; Settings rows override them.
+
+_PROMPT_FIELD_TO_KEY = {
+    "long_mode": "prompt_long_mode",
+    "long_mode_legacy": "prompt_long_mode_legacy",
+    "long_mode_suffix": "prompt_long_mode_suffix",
+    "short_mode": "prompt_short_mode",
+    "short_mode_legacy": "prompt_short_mode_legacy",
+    "short_mode_suffix": "prompt_short_mode_suffix",
+    "important_notice": "prompt_important_notice",
+    "proactive_extra": "prompt_proactive_extra",
+    "trigger_first": "prompt_trigger_first",
+    "trigger_followup": "prompt_trigger_followup",
+    "cafe_trigger_header": "prompt_cafe_trigger_header",
+    "qq_group_trigger_header": "prompt_qq_group_trigger_header",
+}
+
+
+class PromptsResponse(BaseModel):
+    long_mode: str
+    long_mode_legacy: str
+    long_mode_suffix: str
+    short_mode: str
+    short_mode_legacy: str
+    short_mode_suffix: str
+    important_notice: str
+    proactive_extra: str
+    trigger_first: str
+    trigger_followup: str
+    cafe_trigger_header: str
+    qq_group_trigger_header: str
+
+
+class PromptsUpdateRequest(BaseModel):
+    long_mode: str
+    long_mode_legacy: str
+    long_mode_suffix: str
+    short_mode: str
+    short_mode_legacy: str
+    short_mode_suffix: str
+    important_notice: str
+    proactive_extra: str
+    trigger_first: str
+    trigger_followup: str
+    cafe_trigger_header: str
+    qq_group_trigger_header: str
+
+
+def _load_prompt_defaults() -> dict[str, str]:
+    from app.services.chat.chat_service import (
+        DEFAULT_LONG_MODE, DEFAULT_LONG_MODE_LEGACY, DEFAULT_LONG_MODE_SUFFIX,
+        DEFAULT_SHORT_MODE, DEFAULT_SHORT_MODE_LEGACY, DEFAULT_SHORT_MODE_SUFFIX,
+        DEFAULT_IMPORTANT_NOTICE,
+    )
+    from app.services.proactive_service import (
+        PROACTIVE_EXTRA_PROMPT, TRIGGER_PROMPT_FIRST, TRIGGER_PROMPT_FOLLOWUP,
+    )
+    from app.services.cafe_service import DEFAULT_CAFE_TRIGGER_HEADER
+    from app.qq.handlers import DEFAULT_QQ_GROUP_TRIGGER_HEADER
+    return {
+        "long_mode": DEFAULT_LONG_MODE,
+        "long_mode_legacy": DEFAULT_LONG_MODE_LEGACY,
+        "long_mode_suffix": DEFAULT_LONG_MODE_SUFFIX,
+        "short_mode": DEFAULT_SHORT_MODE,
+        "short_mode_legacy": DEFAULT_SHORT_MODE_LEGACY,
+        "short_mode_suffix": DEFAULT_SHORT_MODE_SUFFIX,
+        "important_notice": DEFAULT_IMPORTANT_NOTICE,
+        "proactive_extra": PROACTIVE_EXTRA_PROMPT,
+        "trigger_first": TRIGGER_PROMPT_FIRST,
+        "trigger_followup": TRIGGER_PROMPT_FOLLOWUP,
+        "cafe_trigger_header": DEFAULT_CAFE_TRIGGER_HEADER,
+        "qq_group_trigger_header": DEFAULT_QQ_GROUP_TRIGGER_HEADER,
+    }
+
+
+@router.get("/settings/prompts", response_model=PromptsResponse)
+def get_prompts(db: Session = Depends(get_db)) -> PromptsResponse:
+    defaults = _load_prompt_defaults()
+    out = {}
+    for field, key in _PROMPT_FIELD_TO_KEY.items():
+        row = db.query(Settings).filter(Settings.key == key).first()
+        out[field] = row.value if row and row.value else defaults[field]
+    return PromptsResponse(**out)
+
+
+@router.put("/settings/prompts", response_model=PromptsResponse)
+def put_prompts(payload: PromptsUpdateRequest, db: Session = Depends(get_db)) -> PromptsResponse:
+    for field, key in _PROMPT_FIELD_TO_KEY.items():
+        val = getattr(payload, field) or ""
+        row = db.query(Settings).filter(Settings.key == key).first()
+        if row:
+            row.value = val
+        else:
+            db.add(Settings(key=key, value=val))
+    db.commit()
+    return get_prompts(db)
+
+
+@router.get("/settings/prompts/defaults", response_model=PromptsResponse)
+def get_prompt_defaults() -> PromptsResponse:
+    return PromptsResponse(**_load_prompt_defaults())

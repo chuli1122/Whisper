@@ -4,14 +4,17 @@ import { loginWithPassword } from "./utils/api";
 import Home from "./pages/Home";
 import WorldBooks from "./pages/WorldBooks";
 import WorldBookEdit from "./pages/WorldBookEdit";
+import MemeEdit from "./pages/MemeEdit";
 import Assistants from "./pages/Assistants";
 import AssistantEdit from "./pages/AssistantEdit";
 import Settings from "./pages/Settings";
 import ApiSettings from "./pages/ApiSettings";
 import ProactiveSettings from "./pages/ProactiveSettings";
 import VoiceSettings from "./pages/VoiceSettings";
+import SecuritySettings from "./pages/SecuritySettings";
+import ChannelSettings from "./pages/ChannelSettings";
+import PromptEditor from "./pages/PromptEditor";
 import CotViewer from "./pages/CotViewer";
-import Messages from "./pages/Messages";
 import Memories from "./pages/Memories";
 import Diary from "./pages/Diary";
 import PendingMemories from "./pages/PendingMemories";
@@ -28,22 +31,43 @@ function syncHeight() {
 /* ── Login screen ── */
 
 function LoginScreen({ onSuccess }) {
+  const [step, setStep] = useState("password"); // "password" | "totp"
   const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!password.trim()) return;
-    setLoading(true);
-    setError("");
-    try {
-      await loginWithPassword(password);
-      onSuccess();
-    } catch (err) {
-      setError(err.message || "密码错误");
-    } finally {
-      setLoading(false);
+    if (step === "password") {
+      if (!password.trim()) return;
+      setLoading(true);
+      setError("");
+      try {
+        await loginWithPassword(password);
+        onSuccess();
+      } catch (err) {
+        if (err.message && err.message.includes("TOTP")) {
+          setStep("totp");
+          setError("");
+        } else {
+          setError(err.message || "密码错误");
+        }
+      } finally {
+        setLoading(false);
+      }
+    } else {
+      if (!totpCode.trim()) return;
+      setLoading(true);
+      setError("");
+      try {
+        await loginWithPassword(password, totpCode);
+        onSuccess();
+      } catch (err) {
+        setError(err.message || "验证码错误");
+      } finally {
+        setLoading(false);
+      }
     }
   };
 
@@ -88,30 +112,57 @@ function LoginScreen({ onSuccess }) {
               marginTop: 4,
             }}
           >
-            请输入密码
+            {step === "password" ? "请输入密码" : "请输入验证码"}
           </p>
         </div>
 
         <form onSubmit={handleSubmit}>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="密码"
-            autoFocus
-            style={{
-              width: "100%",
-              padding: "12px 16px",
-              borderRadius: 14,
-              border: "none",
-              outline: "none",
-              fontSize: 14,
-              color: "var(--text)",
-              background: "var(--bg)",
-              boxShadow: "var(--inset-shadow)",
-              boxSizing: "border-box",
-            }}
-          />
+          {step === "password" ? (
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="密码"
+              autoFocus
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                borderRadius: 14,
+                border: "none",
+                outline: "none",
+                fontSize: 14,
+                color: "var(--text)",
+                background: "var(--bg)",
+                boxShadow: "var(--inset-shadow)",
+                boxSizing: "border-box",
+              }}
+            />
+          ) : (
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={totpCode}
+              onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              placeholder="6位验证码"
+              maxLength={6}
+              autoFocus
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                borderRadius: 14,
+                border: "none",
+                outline: "none",
+                fontSize: 14,
+                color: "var(--text)",
+                background: "var(--bg)",
+                boxShadow: "var(--inset-shadow)",
+                boxSizing: "border-box",
+                letterSpacing: "0.3em",
+                textAlign: "center",
+              }}
+            />
+          )}
           {error && (
             <p
               style={{
@@ -127,7 +178,7 @@ function LoginScreen({ onSuccess }) {
           )}
           <button
             type="submit"
-            disabled={loading || !password.trim()}
+            disabled={loading || (step === "password" ? !password.trim() : !totpCode.trim())}
             style={{
               width: "100%",
               marginTop: 16,
@@ -138,15 +189,15 @@ function LoginScreen({ onSuccess }) {
               fontWeight: 600,
               color: "#fff",
               background:
-                loading || !password.trim()
+                loading || (step === "password" ? !password.trim() : !totpCode.trim())
                   ? "var(--text-muted)"
                   : "linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%)",
               cursor:
-                loading || !password.trim() ? "not-allowed" : "pointer",
+                loading || (step === "password" ? !password.trim() : !totpCode.trim()) ? "not-allowed" : "pointer",
               boxShadow: "var(--card-shadow-sm)",
             }}
           >
-            {loading ? "验证中..." : "确认"}
+            {loading ? "验证中..." : step === "password" ? "下一步" : "确认"}
           </button>
         </form>
       </div>
@@ -174,6 +225,8 @@ function AppRoutes() {
       <Route path="/world-books" element={<WorldBooks />} />
       <Route path="/world-books/new" element={<WorldBookEdit />} />
       <Route path="/world-books/:id" element={<WorldBookEdit />} />
+      <Route path="/memes/new" element={<MemeEdit />} />
+      <Route path="/memes/:id" element={<MemeEdit />} />
       <Route path="/assistants" element={<Assistants />} />
       <Route path="/assistants/new" element={<AssistantEdit />} />
       <Route path="/assistants/:id" element={<AssistantEdit />} />
@@ -181,11 +234,14 @@ function AppRoutes() {
       <Route path="/settings/api" element={<ApiSettings />} />
       <Route path="/settings/proactive" element={<ProactiveSettings />} />
       <Route path="/settings/voice" element={<VoiceSettings />} />
+      <Route path="/settings/security" element={<SecuritySettings />} />
+      <Route path="/settings/channels" element={<ChannelSettings />} />
+      <Route path="/settings/prompts" element={<PromptEditor />} />
       <Route path="/cot" element={<CotViewer />} />
       <Route path="/memories" element={<Memories />} />
       <Route path="/pending-memories" element={<PendingMemories />} />
       <Route path="/diary" element={<Diary />} />
-      <Route path="/messages" element={<Messages />} />
+
     </Routes>
   );
 }

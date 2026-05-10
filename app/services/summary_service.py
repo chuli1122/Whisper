@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -33,10 +34,23 @@ TZ_EAST8 = timezone(timedelta(hours=8))
 
 
 def _call_model_raw(
-    db: Session, preset: ModelPreset, system_prompt: str, user_text: str,
-    *, timeout: float | None = None,
+    db: Session, preset: ModelPreset, system_prompt: str, user_text: str | list,
+    *, timeout: float | None = None, source: str | None = None,
+    assistant_id: int | None = 2,
+    cot_request_id: str | None = None, cot_round_index: int = 0,
+    cot_emit_done: bool = True,
+    messages: list[dict[str, Any]] | None = None,
+    response_blocks_out: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Call a model preset and return raw text response."""
+    """Call a model preset and return raw text response.
+
+    user_text can be a string or a list of content blocks (for multimodal).
+    Also writes COT records (thinking + text + usage) with model_info badge.
+    Pass source= to label the COT card (e.g. "reflection", "summary", "merge").
+    """
+    import time as _time
+    import uuid as _uuid
+
     api_provider = db.get(ApiProvider, preset.api_provider_id)
     if not api_provider:
         raise ValueError(f"API provider not found for preset_id={preset.id}")
@@ -46,23 +60,50 @@ def _call_model_raw(
         base_url = base_url[: -len("/chat/completions")]
         if not base_url.endswith("/v1"):
             base_url = f"{base_url.rstrip('/')}/v1"
-    if api_provider.auth_type == "oauth_token":
-        _anth_kwargs: dict[str, Any] = {
-            "auth_token": api_provider.api_key,
-            "default_headers": {
-                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
-                "user-agent": "claude-cli/2.1.2 (external, cli)",
-                "x-app": "cli",
-            },
-        }
-        if timeout is not None:
-            _anth_kwargs["timeout"] = timeout
-        anth_client = anthropic.Anthropic(**_anth_kwargs)
+
+    t0 = _time.time()
+    thinking_text = ""
+    content = ""
+    usage_info: dict[str, Any] = {}
+    _round_usage: dict[str, Any] | None = None
+
+    _is_oauth = api_provider.auth_type in ("oauth_token", "oauth_claude")
+    _is_anthropic_native = api_provider.auth_type in ("anthropic", "oauth_token", "oauth_claude")
+    if _is_anthropic_native:
+        from app.services.chat.config_helpers import normalize_anthropic_base_url
+
+        if _is_oauth:
+            from app.services.chat.oauth_helper import ensure_valid_token, inject_billing_header
+            _access_token = ensure_valid_token(db, api_provider=api_provider) or api_provider.api_key
+        else:
+            ensure_valid_token = None  # not used for api_key auth
+            inject_billing_header = None
+            _access_token = None
+
+        def _make_anth_client(tok: str | None) -> anthropic.Anthropic:
+            _kw: dict[str, Any] = {}
+            if _is_oauth:
+                _kw["auth_token"] = tok
+                _kw["default_headers"] = {
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                    "user-agent": "claude-code/2.1.77 (external, cli)",
+                    "x-app": "cli",
+                }
+            else:
+                _kw["api_key"] = api_provider.api_key
+                _anth_base_url = normalize_anthropic_base_url(base_url)
+                if _anth_base_url:
+                    _kw["base_url"] = _anth_base_url
+            if timeout is not None:
+                _kw["timeout"] = timeout
+            return anthropic.Anthropic(**_kw)
+
+        anth_client = _make_anth_client(_access_token)
         _summary_tb = preset.thinking_budget or 0
         anth_kwargs: dict[str, Any] = {
             "model": preset.model_name,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": user_text}],
+            "messages": messages if messages is not None else [{"role": "user", "content": user_text}],
         }
         if _summary_tb > 0:
             anth_kwargs["max_tokens"] = preset.max_tokens + _summary_tb
@@ -73,22 +114,78 @@ def _call_model_raw(
             anth_kwargs["temperature"] = preset.temperature
         if preset.top_p is not None:
             anth_kwargs["top_p"] = preset.top_p
-        anth_response = anth_client.messages.create(**anth_kwargs)
-        content = ""
+        if _is_oauth and inject_billing_header is not None:
+            inject_billing_header(anth_kwargs)
+        try:
+            anth_response = anth_client.messages.create(**anth_kwargs)
+        except anthropic.AuthenticationError:
+            # Token went stale mid-flight — force refresh and retry once (OAuth only)
+            if _is_oauth and ensure_valid_token is not None:
+                logger.info("[summary] OAuth 401, forcing token refresh and retrying once")
+                _refreshed = ensure_valid_token(db, api_provider=api_provider, force=True)
+                if _refreshed and _refreshed != _access_token:
+                    anth_client = _make_anth_client(_refreshed)
+                    anth_response = anth_client.messages.create(**anth_kwargs)
+                else:
+                    raise
+            else:
+                raise
         for block in anth_response.content:
-            if block.type == "text":
+            if block.type == "thinking":
+                thinking_text += block.thinking
+                if response_blocks_out is not None:
+                    response_blocks_out.append({
+                        "type": "thinking", "thinking": block.thinking,
+                        "signature": getattr(block, "signature", ""),
+                    })
+            elif block.type == "text":
                 content += block.text
+                if response_blocks_out is not None:
+                    response_blocks_out.append({"type": "text", "text": block.text})
+        if anth_response.usage:
+            _su = anth_response.usage
+            _s_cache_read = getattr(_su, "cache_read_input_tokens", 0) or 0
+            _s_cache_create = getattr(_su, "cache_creation_input_tokens", 0) or 0
+            usage_info = {
+                "prompt_tokens": _su.input_tokens,
+                "completion_tokens": _su.output_tokens,
+                "cache_hit": _s_cache_read > 0,
+                "total_input": _su.input_tokens + _s_cache_read + _s_cache_create,
+            }
+            _round_usage = {
+                "input": _su.input_tokens,
+                "cache_create": _s_cache_create,
+                "cache_read": _s_cache_read,
+                "output": _su.output_tokens,
+            }
     else:
         _oai_kwargs: dict[str, Any] = {"api_key": api_provider.api_key, "base_url": base_url}
         if timeout is not None:
             _oai_kwargs["timeout"] = timeout
         oai_client = OpenAI(**_oai_kwargs)
+        # Convert Anthropic-format image blocks to OpenAI format if needed
+        _oai_user_content = user_text
+        if isinstance(user_text, list):
+            _oai_user_content = []
+            for _block in user_text:
+                if isinstance(_block, dict) and _block.get("type") == "image":
+                    _src = _block.get("source", {})
+                    _oai_user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_src.get('media_type', 'image/jpeg')};base64,{_src.get('data', '')}"},
+                    })
+                else:
+                    _oai_user_content.append(_block)
+        if messages is not None:
+            _oai_messages = [{"role": "system", "content": system_prompt}] + messages
+        else:
+            _oai_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": _oai_user_content},
+            ]
         params: dict[str, Any] = {
             "model": preset.model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
+            "messages": _oai_messages,
             "max_tokens": preset.max_tokens,
         }
         if preset.temperature is not None:
@@ -97,18 +194,103 @@ def _call_model_raw(
             params["top_p"] = preset.top_p
         _summary_tb_oai = preset.thinking_budget or 0
         if _summary_tb_oai > 0:
-            params["extra_body"] = {"reasoning": {"max_tokens": _summary_tb_oai}}
+            params["extra_body"] = {
+                "reasoning": {"max_tokens": _summary_tb_oai},
+                "enable_thinking": True,
+                "thinking_budget": _summary_tb_oai,
+            }
+        else:
+            params["extra_body"] = {"enable_thinking": False}
         oai_response = oai_client.chat.completions.create(**params)
         if not oai_response.choices:
             raise ValueError("Response contained no choices.")
         msg = oai_response.choices[0].message
         content = msg.content or ""
+        if response_blocks_out is not None:
+            response_blocks_out.append({"type": "text", "text": content})
+        reasoning_content = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+        if reasoning_content:
+            thinking_text = str(reasoning_content)
+        if oai_response.usage:
+            _ou = oai_response.usage
+            _o_cached = getattr(_ou, "prompt_tokens_details", None)
+            _o_cache_read = getattr(_o_cached, "cached_tokens", 0) or 0 if _o_cached else 0
+            usage_info = {
+                "prompt_tokens": _ou.prompt_tokens or 0,
+                "completion_tokens": _ou.completion_tokens or 0,
+                "total_input": _ou.prompt_tokens or 0,
+            }
+            _round_usage = {
+                "input": (_ou.prompt_tokens or 0) - _o_cache_read,
+                "cache_create": 0,
+                "cache_read": _o_cache_read,
+                "output": _ou.completion_tokens or 0,
+            }
+
+    usage_info["elapsed_ms"] = int((_time.time() - t0) * 1000)
+
+    # Write COT records (skip if source is explicitly False)
+    if source is False:
+        return content
+    try:
+        from app.models.models import CotRecord
+        from app.cot_broadcaster import cot_broadcaster
+
+        request_id = cot_request_id or str(_uuid.uuid4())
+        _ri = cot_round_index
+        model_info = {
+            "model_name": preset.model_name,
+            "preset_name": preset.name,
+            "source": source or "summary",
+        }
+
+        def _add(round_idx: int, block_type: str, blk_content: str):
+            db.add(CotRecord(
+                request_id=request_id, round_index=round_idx,
+                block_type=block_type, content=blk_content,
+                tool_name=None, assistant_id=assistant_id,
+            ))
+            cot_broadcaster.publish({
+                "type": block_type, "request_id": str(request_id),
+                "round_index": round_idx, "block_type": block_type,
+                "content": blk_content, "tool_name": None,
+                "assistant_id": assistant_id,
+            })
+
+        _add(_ri, "model_info", json.dumps(model_info, ensure_ascii=False))
+        if _round_usage:
+            _add(_ri, "round_usage", json.dumps(_round_usage))
+        if thinking_text:
+            _add(_ri, "thinking", thinking_text)
+        if content:
+            _add(_ri, "text", content)
+        if cot_emit_done:
+            _add(9999, "usage", json.dumps(usage_info))
+            cot_broadcaster.publish({
+                "type": "done", "request_id": str(request_id), "assistant_id": assistant_id,
+            })
+        db.flush()
+    except Exception:
+        logger.warning("[summary] failed to write COT records", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     return content
 
 
-def translate_text(db: Session, text: str) -> str:
-    """Translate text to Chinese using the summary fallback model."""
-    assistant = db.query(Assistant).first()
+def translate_text(db: Session, text: str, assistant_id: int | None = None) -> str:
+    """Translate text to Chinese using the summary fallback model.
+
+    assistant_id: which assistant's preset to use. If not given, falls back
+    to the first assistant (legacy behavior).
+    """
+    assistant = None
+    if assistant_id is not None:
+        assistant = db.get(Assistant, assistant_id)
+    if not assistant:
+        assistant = db.query(Assistant).first()
     if not assistant:
         raise ValueError("No assistant configured")
 
@@ -123,7 +305,7 @@ def translate_text(db: Session, text: str) -> str:
         raise ValueError("No model preset available")
 
     system_prompt = "你是翻译助手。将以下英文内容翻译成中文，保持原意，只输出翻译结果。"
-    return _call_model_raw(db, preset, system_prompt, text)
+    return _call_model_raw(db, preset, system_prompt, text, source=False)
 
 
 class SummaryService:
@@ -180,18 +362,23 @@ class SummaryService:
                 len(trimmed_msgs), len(retained_msgs), session_id, max_trimmed_id,
             )
 
-            trimmed_text = self._format_messages(trimmed_msgs or messages, user_name, assistant_name)
+            trimmed_text, trimmed_images = self._format_messages(trimmed_msgs or messages, user_name, assistant_name)
             if not trimmed_text.strip():
                 logger.warning("Summary skipped: no usable message content (session_id=%s).", session_id)
                 return
 
-            conversation_text = trimmed_text
-
-            # Append latest (retained) messages for mood detection
-            if retained_msgs:
-                retained_text = self._format_messages(retained_msgs, user_name, assistant_name)
-                if retained_text.strip():
-                    conversation_text += f"\n\n--- 以下是最新对话（仅用于判断当前情绪，不需要写入摘要） ---\n{retained_text}"
+            conversation_text_str = (
+                trimmed_text
+                + "\n\n===== 对话记录结束 =====\n"
+                "请根据system prompt中的任务要求，对以上对话输出JSON。不要回复对话内容。"
+            )
+            if trimmed_images:
+                resized = self._resize_images_for_summary(trimmed_images)
+                conversation_text: str | list = [{"type": "text", "text": conversation_text_str}]
+                for _mt, _b64 in resized:
+                    conversation_text.append({"type": "image", "source": {"type": "base64", "media_type": _mt, "data": _b64}})
+            else:
+                conversation_text = conversation_text_str
 
             # Build system prompt: full persona + summary/extraction tasks
             base_persona = (assistant.system_prompt or "").strip()
@@ -206,14 +393,14 @@ class SummaryService:
 
 【话题】关键词1、关键词2、关键词3（短关键词列表，3-6个）
 【人物】涉及的人物名字（没有就不写这行）
-【情绪】情绪变化（可写 A→B，如"焦虑→平静"）
+【情绪】她的情绪变化（可写 A→B，如"焦虑→平静"）
 【摘要】
 摘要正文
 
 重点记录：聊了什么、做了什么决定、情绪变化、新暴露的信息。
 时间用具体描述如"2.5晚上20点左右"，不要用"刚才""昨天"这类相对时间。
 亲密场景：只记场景设定、她表达的偏好、情绪变化，不记具体行为描写。
-如果对话中有工具调用（如存储记忆、搜索记忆等），在摘要正文中自然地概括，例如'我存储了一条关于xxx的记忆'。
+工具调用（存储记忆、搜索、网页等）只需一笔带过，例如'我存了一条关于xxx的记忆''我搜了xxx'。不要记录工具的参数、返回内容或调用过程。
 单条摘要严格控制在500字以内。只记结论、决定和关键转折，省略过程性对话。
 
 任务二：记忆提取
@@ -221,30 +408,55 @@ class SummaryService:
 - 对话中已通过 save_memory 存过的不要重复提取
 - 每条记忆不超过100字，用第一人称记录
 - 时间戳由后端自动添加，content里不要写日期时间，除非记录的是过去发生的事
-- klass：identity / relationship / bond / conflict / fact / preference / health / task / other
+- klass分类（严格按定义归类）：
+  identity：关于她是谁（名字、身份、自我认知、人生经历）
+  relationship：日常相处模式、互动习惯、称呼方式、相处中的默契
+  bond：重大情感里程碑、关系转折点、深层情感表达（不是日常亲昵）
+  conflict：争吵、矛盾、误解、冷战、道歉
+  fact：客观事件、具体发生的事、外部信息
+  preference：喜好、习惯、偏好、厌恶
+  health：身体状况、作息、饮食、精神状态
+  task：待办、约定、承诺、计划
+  other：以上都不符合
 - 日常闲聊、没有新信息的内容不需要提取
 - 没有值得提取的就返回空数组
 - tags：给每条记忆加1-3个短关键词标签，方便检索
-
-任务三：情绪标签
-根据最新对话（分隔线以下的部分）判断{user_name}此刻的情绪状态，从以下选一个：
-sad/angry/anxious/tired/emo/happy/flirty/proud/calm
-注意：如果没有最新对话部分，则根据待压缩对话的末尾判断。
+- disclosure：写一句"什么情况下应该想起这条记忆"，用于情境触发召回。例如："当她提到工作压力时""当讨论到未来计划时""当她情绪低落时"
 
 输出格式：
-{{"summary": "...", "memories": [{{"content": "...", "klass": "...", "tags": ["标签1", "标签2"]}}, ...], "mood_tag": "..."}}
+{{"summary": "...", "memories": [{{"content": "...", "klass": "...", "tags": ["标签1", "标签2"], "disclosure": "..."}}, ...]}}
 memories 为空时写 "memories": []
+文本中引用内容一律用直角引号「」，不要用英文双引号，避免破坏JSON格式。
 """.strip()
 
-            if is_chat_session:
-                system_prompt = base_persona + "\n\n" + task_instructions if base_persona else task_instructions
-            else:
-                # Group session: no mood_tag
-                group_task = task_instructions.replace(
-                    f'根据最新对话（分隔线以下的部分）判断{user_name}此刻的情绪状态，从以下选一个：\nsad/angry/anxious/tired/emo/happy/flirty/proud/calm\n注意：如果没有最新对话部分，则根据待压缩对话的末尾判断。',
-                    '',
-                ).replace(', "mood_tag": "..."', '')
-                system_prompt = base_persona + "\n\n" + group_task if base_persona else group_task
+            recent_examples = (
+                db.query(SessionSummary)
+                .filter(
+                    SessionSummary.session_id == session_id,
+                    SessionSummary.assistant_id == assistant_id,
+                    SessionSummary.deleted_at.is_(None),
+                    SessionSummary.summary_content.isnot(None),
+                )
+                .order_by(SessionSummary.id.desc())
+                .limit(3)
+                .all()
+            )
+            examples_xml = ""
+            if recent_examples:
+                blocks = [
+                    f"[历史摘要 {i + 1} | msg {s.msg_id_start}-{s.msg_id_end}]\n{s.summary_content.strip()}"
+                    for i, s in enumerate(reversed(recent_examples))
+                ]
+                examples_xml = (
+                    "\n\n参考以下历史摘要，保持第一人称视角。\n\n"
+                    + "\n\n".join(blocks)
+                )
+
+            system_prompt = (
+                base_persona + "\n\n" + task_instructions + examples_xml
+                if base_persona
+                else task_instructions + examples_xml
+            )
 
             parsed_payload: dict[str, Any] | None = None
             try:
@@ -281,28 +493,12 @@ memories 为空时写 "memories": []
                         primary_preset.id,
                     )
             if not parsed_payload:
-                return
+                raise RuntimeError("Both primary and fallback summary models failed")
 
             summary_text = str(parsed_payload.get("summary", "")).strip()
             if not summary_text:
                 logger.warning("Summary skipped: empty summary content (session_id=%s).", session_id)
                 return
-
-            valid_moods = {
-                "sad",
-                "angry",
-                "anxious",
-                "tired",
-                "emo",
-                "happy",
-                "flirty",
-                "proud",
-                "calm",
-            }
-            mood_tag = None
-            if is_chat_session:
-                mood_tag_raw = str(parsed_payload.get("mood_tag", "")).strip().lower()
-                mood_tag = mood_tag_raw if mood_tag_raw in valid_moods else None
 
             msg_ids = [message.id for message in messages if message.id is not None]
             msg_id_start = msg_ids[0] if msg_ids else None
@@ -318,18 +514,9 @@ memories 为空时写 "memories": []
                 msg_id_end=msg_id_end,
                 time_start=time_start,
                 time_end=time_end,
-                mood_tag=mood_tag,
             )
             db.add(summary)
             db.flush()
-
-            # Clear manual mood flag when auto-summary detects mood
-            if mood_tag:
-                manual_row = db.query(Settings).filter(Settings.key == "mood_manual").first()
-                if manual_row:
-                    manual_row.value = "false"
-                else:
-                    db.add(Settings(key="mood_manual", value="false"))
 
             if msg_ids:
                 updated = db.query(Message).filter(Message.id.in_(msg_ids)).update(
@@ -338,9 +525,25 @@ memories 为空时写 "memories": []
                 )
                 logger.info("Marked %d/%d messages with summary_group_id=%s", updated, len(msg_ids), summary.id)
 
+            # Also mark any messages in the range that were missed (e.g. tool-call
+            # chains extracted into tool_cache before trimming).  Without this,
+            # a restart backfill would mark them later, shifting the conversation
+            # prefix and breaking the Anthropic prompt cache.
+            range_updated = db.query(Message).filter(
+                Message.session_id == session_id,
+                Message.id.between(msg_id_start, msg_id_end),
+                Message.summary_group_id.is_(None),
+            ).update(
+                {Message.summary_group_id: summary.id},
+                synchronize_session=False,
+            )
+            if range_updated:
+                logger.info("Range-marked %d extra messages in [%s-%s] with summary_group_id=%s",
+                            range_updated, msg_id_start, msg_id_end, summary.id)
+
             db.commit()
-            logger.info("Summary generated OK (session_id=%s, summary_id=%s, mood=%s).",
-                        session_id, summary.id, mood_tag)
+            logger.info("Summary generated OK (session_id=%s, summary_id=%s).",
+                        session_id, summary.id)
 
             # Process extracted memories → pending_memories table
             raw_memories = parsed_payload.get("memories", [])
@@ -381,6 +584,7 @@ memories 为空时写 "memories": []
                 klass = "other"
             raw_tags = mem.get("tags", [])
             tags = {"topic": [str(t) for t in raw_tags[:6]] if isinstance(raw_tags, list) else []}
+            disclosure = str(mem.get("disclosure", "")).strip() or None
             klass_config = KLASS_DEFAULTS.get(klass, KLASS_DEFAULTS["other"])
             # Get embedding for dedup
             embedding = embedding_service.get_embedding(content)
@@ -433,6 +637,7 @@ memories 为空时写 "memories": []
                 importance=klass_config["importance"],
                 halflife_days=klass_config["halflife_days"],
                 is_pending=True,
+                disclosure=disclosure,
             )
             db.add(memory)
             db.flush()  # get memory.id
@@ -471,6 +676,7 @@ memories 为空时写 "memories": []
 
         threading.Thread(target=_worker, daemon=True).start()
 
+
     def _resolve_primary_preset(
         self, db: Session, assistant: Assistant
     ) -> ModelPreset | None:
@@ -508,29 +714,102 @@ memories 为空时写 "memories": []
         system_prompt: str,
         conversation_text: str,
     ) -> dict[str, Any]:
-        content = _call_model_raw(db, preset, system_prompt, conversation_text)
-        cleaned_content = content.strip()
-        if cleaned_content.startswith("```json"):
-            cleaned_content = cleaned_content[len("```json") :]
-        elif cleaned_content.startswith("```"):
-            cleaned_content = cleaned_content[len("```") :]
-        if cleaned_content.endswith("```"):
-            cleaned_content = cleaned_content[: -len("```")]
-        cleaned_content = cleaned_content.strip()
-        # Handle "Extra data" — model may return multiple JSON objects
+        import uuid as _uuid
+        from app.cot_broadcaster import cot_broadcaster
+
+        _cot_rid = str(_uuid.uuid4())
+        _resp_blocks: list[dict[str, Any]] = []
+        content = _call_model_raw(
+            db, preset, system_prompt, conversation_text, source="摘要",
+            cot_request_id=_cot_rid, cot_round_index=0, cot_emit_done=False,
+            response_blocks_out=_resp_blocks,
+        )
+        payload = self._parse_summary_json(content)
+
+        summary_text = str(payload.get("summary", "")).strip()
+        for _ci in range(3):
+            if len(summary_text) <= 1000:
+                break
+            logger.info(
+                "[summary] Too long (%d chars), requesting rewrite round %d",
+                len(summary_text), _ci + 1,
+            )
+            rewrite_messages = [
+                {"role": "user", "content": conversation_text},
+                {"role": "assistant", "content": _resp_blocks},
+                {"role": "user", "content": (
+                    f"你的摘要有{len(summary_text)}字，超过1000字上限。"
+                    f"请精简到700字以内，保留关键事件和情绪变化。只输出JSON。"
+                )},
+            ]
+            try:
+                _retry_blocks: list[dict[str, Any]] = []
+                content = _call_model_raw(
+                    db, preset, system_prompt, None, source="摘要精简",
+                    cot_request_id=_cot_rid, cot_round_index=_ci + 1, cot_emit_done=False,
+                    messages=rewrite_messages, response_blocks_out=_retry_blocks,
+                )
+                new_payload = self._parse_summary_json(content)
+                new_summary = str(new_payload.get("summary", "")).strip()
+                if new_summary and len(new_summary) < len(summary_text):
+                    logger.info("[summary] Rewrite %d → %d chars", len(summary_text), len(new_summary))
+                    payload = new_payload
+                    summary_text = new_summary
+                    _resp_blocks = _retry_blocks
+                else:
+                    break
+            except Exception:
+                logger.warning("[summary] Rewrite round %d failed", _ci + 1, exc_info=True)
+                break
+
+        cot_broadcaster.publish({
+            "type": "done", "request_id": _cot_rid, "assistant_id": 2,
+        })
+        return payload
+
+    @staticmethod
+    def _parse_summary_json(content: str) -> dict[str, Any]:
+        logger.info("[summary] Raw model output (first 500 chars): %s", content[:500])
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[len("```json"):]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[len("```"):]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-len("```")]
+        cleaned = cleaned.strip()
         try:
-            payload = json.loads(cleaned_content)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            payload, _ = decoder.raw_decode(cleaned_content)
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.warning("[summary] JSON parse failed at pos %s: ...%s...",
+                           e.pos, cleaned[max(0, (e.pos or 0) - 30):(e.pos or 0) + 30])
+            try:
+                decoder = json.JSONDecoder()
+                payload, _ = decoder.raw_decode(cleaned)
+            except json.JSONDecodeError:
+                repaired = re.sub(r'"\s*\n\s*"', '",\n"', cleaned)
+                repaired = re.sub(r'(\})\s*\n\s*"', '},\n"', repaired)
+                repaired = re.sub(r'(\])\s*\n\s*"', '],\n"', repaired)
+                repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+                try:
+                    payload = json.loads(repaired)
+                    logger.info("[summary] JSON repair succeeded")
+                except json.JSONDecodeError:
+                    decoder = json.JSONDecoder()
+                    payload, _ = decoder.raw_decode(repaired)
         if not isinstance(payload, dict):
             raise ValueError("Summary response is not a JSON object.")
         return payload
 
     def _format_messages(
         self, messages: list[Message], user_name: str, assistant_name: str
-    ) -> str:
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Format messages for summary. Returns (text, images).
+
+        images: list of (media_type, base64_data) tuples for multimodal API calls.
+        """
         lines: list[str] = []
+        images: list[tuple[str, str]] = []
         for message in messages:
             role = (message.role or "").lower()
             meta = message.meta_info or {}
@@ -538,9 +817,32 @@ memories 为空时写 "memories": []
             if role == "user":
                 speaker = user_name
                 content = (message.content or "").strip()
+                # Collect image data for multimodal summary
+                if message.image_data:
+                    _img_data = message.image_data
+                    if _img_data.startswith("media:"):
+                        _fn = _img_data[6:]
+                        from app.services.media_service import get_file_path
+                        _path = get_file_path(_fn)
+                        if _path:
+                            import base64
+                            _img_bytes = _path.read_bytes()
+                            _b64 = base64.b64encode(_img_bytes).decode("ascii")
+                            _mime = "image/png" if _img_bytes[:8] == b'\x89PNG\r\n\x1a\n' else "image/gif" if _img_bytes[:6] in (b'GIF87a', b'GIF89a') else "image/webp" if _img_bytes[:4] == b'RIFF' and _img_bytes[8:12] == b'WEBP' else "image/jpeg"
+                            images.append((_mime, _b64))
+                            content = f"{content}\n[图片]" if content else "[图片]"
+                        else:
+                            content = f"{content}\n[图片已过期]" if content else "[图片已过期]"
+                    elif _img_data.startswith("data:"):
+                        try:
+                            _meta, _b64 = _img_data.split(",", 1)
+                            _mt = _meta.split(":")[1].split(";")[0]
+                            images.append((_mt, _b64))
+                            content = f"{content}\n[图片]" if content else "[图片]"
+                        except Exception:
+                            pass
             elif role == "assistant":
                 if "tool_call" in meta:
-                    # Tool call placeholder — format as tool invocation
                     tc = meta["tool_call"]
                     tool_name = tc.get("tool_name", "unknown")
                     args = tc.get("arguments", {})
@@ -550,10 +852,13 @@ memories 为空时写 "memories": []
                     speaker = assistant_name
                     content = (message.content or "").strip()
             elif role == "tool":
-                # Tool result — keep full content for summary model
                 tool_name = meta.get("tool_name", "unknown")
                 raw = (message.content or "").strip()
-                content = f"[工具结果] {tool_name}: {raw}"
+                if raw.startswith("{") and len(raw) > 500:
+                    from app.services.format_converters import _build_tool_index
+                    content = f"[工具结果] {_build_tool_index(tool_name, raw, len(raw))}"
+                else:
+                    content = f"[工具结果] {tool_name}: {raw}"
                 speaker = ""
             else:
                 speaker = role or "unknown"
@@ -569,9 +874,44 @@ memories 为空时写 "memories": []
                 else:
                     lines.append(f"{speaker}: {content}")
             else:
-                # Tool results without speaker prefix
                 lines.append(content)
-        return "\n".join(lines)
+        return "\n".join(lines), images
+
+    @staticmethod
+    def _resize_images_for_summary(
+        images: list[tuple[str, str]], max_dim: int = 1600,
+    ) -> list[tuple[str, str]]:
+        """Resize images so each dimension <= max_dim for multi-image API limits."""
+        import base64
+        from io import BytesIO
+        try:
+            from PIL import Image
+        except ImportError:
+            return images
+
+        result = []
+        for mime, b64 in images:
+            try:
+                raw = base64.b64decode(b64)
+                img = Image.open(BytesIO(raw))
+                w, h = img.size
+                if w <= max_dim and h <= max_dim and mime != "image/gif":
+                    result.append((mime, b64))
+                    continue
+                scale = min(max_dim / w, max_dim / h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+                buf = BytesIO()
+                fmt = "PNG" if mime == "image/png" else "JPEG"
+                out_mime = "image/png" if fmt == "PNG" else "image/jpeg"
+                if mime == "image/gif":
+                    img = img.convert("RGB")
+                img.save(buf, format=fmt, quality=80)
+                result.append((out_mime, base64.b64encode(buf.getvalue()).decode("ascii")))
+                logger.info("[summary] Resized image %dx%d → %dx%d for summary", w, h, new_w, new_h)
+            except Exception:
+                result.append((mime, b64))
+        return result
 
     def _to_utc(self, value: datetime | None) -> datetime | None:
         if value is None:
@@ -692,6 +1032,25 @@ memories 为空时写 "memories": []
                 db.commit()
                 return
 
+            # Fast path: if layer has no existing content, just copy pending text directly (no LLM rewrite)
+            existing_content = (row.content or "").strip()
+            if not existing_content and pending:
+                raw_parts = []
+                for s in pending:
+                    if s.summary_content and s.summary_content.strip():
+                        raw_parts.append(s.summary_content.strip())
+                if raw_parts:
+                    row.content = "\n\n".join(raw_parts)
+                    new_version = (row.version or 0) + 1
+                    row.version = new_version
+                    row.needs_merge = False
+                    new_ids = [s.id for s in pending]
+                    for s in pending:
+                        s.merged_at_version = new_version
+                    db.commit()
+                    logger.info("[merge_layer] %s fast-path: copied %d summaries directly (assistant_id=%s)", layer_type, len(raw_parts), assistant_id)
+                    return
+
             assistant = db.get(Assistant, assistant_id)
             if not assistant:
                 return
@@ -705,13 +1064,13 @@ memories 为空时写 "memories": []
 
             budget_key = f"summary_budget_{layer_type}"
             budget_row = db.query(Settings).filter(Settings.key == budget_key).first()
-            budget_tokens = int(budget_row.value) if budget_row else (800 if layer_type != "recent" else 2000)
+            budget_tokens = int(budget_row.value) if budget_row else (2000 if layer_type != "recent" else 2000)
             max_chars = budget_tokens // 2
 
             if layer_type == "daily":
                 prompt = (
-                    f"你是{assistant_name}，{user_name}的AI伴侣。你在整理自己今天的记忆。\n\n"
-                    f"请将以下内容合并为一段连贯的当日回顾：\n"
+                    f"你是{assistant_name}，{user_name}的AI伴侣。你在整理自己最近的记忆。\n\n"
+                    f"请将以下内容合并为一段连贯的近期回顾：\n"
                     f"- 按时间先后顺序整理\n"
                     f"- 保留关键事件、情绪变化、重要对话内容\n"
                     f"- 去除重复信息\n"
@@ -737,7 +1096,7 @@ memories 为空时写 "memories": []
 
             merged = None
             try:
-                merged = _call_model_raw(db, preset, prompt, merge_input, timeout=60.0)
+                merged = _call_model_raw(db, preset, prompt, merge_input, timeout=300.0, source="合并")
                 merged = (merged or "").strip()
             except Exception:
                 logger.warning(
@@ -748,7 +1107,7 @@ memories 为空时写 "memories": []
                 fallback = self._resolve_fallback_preset(db, assistant)
                 if fallback and fallback.id != preset.id:
                     try:
-                        merged = _call_model_raw(db, fallback, prompt, merge_input, timeout=60.0)
+                        merged = _call_model_raw(db, fallback, prompt, merge_input, timeout=300.0, source="合并")
                         merged = (merged or "").strip()
                         if merged:
                             logger.info(
@@ -776,7 +1135,7 @@ memories 为空时写 "memories": []
                         content=row.content or "",
                         version=row.version,
                     ))
-                    row.version += 1
+                row.version += 1
                 row.content = merged
                 row.needs_merge = False
                 row.token_count = len(merged)
@@ -784,13 +1143,6 @@ memories 为空时写 "memories": []
                 # Mark pending summaries as consumed
                 for s in pending:
                     s.merged_at_version = row.version
-                db.commit()
-                # Cleanup history older than 7 days
-                cutoff = datetime.now(TZ_EAST8) - timedelta(days=7)
-                db.query(SummaryLayerHistory).filter(
-                    SummaryLayerHistory.summary_layer_id == row.id,
-                    SummaryLayerHistory.created_at < cutoff,
-                ).delete()
                 db.commit()
                 logger.info(
                     "[merge_layer] %s merged for assistant_id=%s (%d chars, v%d)",
@@ -887,24 +1239,21 @@ memories 为空时写 "memories": []
             longterm.needs_merge = True
             longterm.updated_at = now
 
-            # Transfer summaries: merged_into → "longterm"
-            # Set merged_at_version = longterm.version + 1 (will be the new version after merge)
-            # so merge_layer won't re-fetch them as pending raw summaries
-            next_lt_version = longterm.version + 1
+            # Transfer summaries: merged_into → "longterm" (mark consumed later after merge)
+            daily_summary_ids = [s.id for s in daily_summaries]
             for s in daily_summaries:
                 s.merged_into = "longterm"
-                s.merged_at_version = next_lt_version
+                s.merged_at_version = None  # will be set after longterm merge
 
             # Save daily content to daily history before clearing
             if has_daily_content:
-                summary_ids = [s.id for s in daily_summaries]
                 db.add(SummaryLayerHistory(
                     summary_layer_id=daily.id,
                     layer_type="daily",
                     assistant_id=daily.assistant_id,
                     content=daily.content or "",
                     version=daily.version,
-                    merged_summary_ids=json.dumps(summary_ids) if summary_ids else None,
+                    merged_summary_ids=json.dumps(daily_summary_ids) if daily_summary_ids else None,
                 ))
 
             # Clear daily — increment version to stay monotonic (don't reset to 1)
@@ -915,6 +1264,8 @@ memories 为空时写 "memories": []
             db.commit()
 
             # Now merge longterm (existing longterm content + daily content appended above)
+            # merge_layer will pick up the transferred summaries (merged_at_version=None)
+            # and set their merged_at_version to the new longterm version
             self.merge_layer(assistant_id, "longterm")
             logger.info("[daily_merge_to_longterm] Completed for assistant_id=%s", assistant_id)
         except Exception:
@@ -927,18 +1278,55 @@ memories 为空时写 "memories": []
 
 
 async def daily_merge_cron() -> None:
-    """Run at midnight (Beijing time) each day: merge daily → longterm for all assistants."""
+    """Run every 7 days at midnight (Beijing time): merge daily → longterm for all assistants."""
     from app.database import SessionLocal
+    from app.models.models import Settings
+
+    MERGE_INTERVAL_DAYS = 7
 
     while True:
         try:
             now_bj = datetime.now(TZ_EAST8)
-            tomorrow = (now_bj + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            wait_seconds = (tomorrow - now_bj).total_seconds()
+
+            # Read last merge date from settings
+            db = SessionLocal()
+            try:
+                last_merge_row = db.query(Settings).filter(Settings.key == "last_weekly_merge").first()
+                if last_merge_row:
+                    last_merge_date = datetime.fromisoformat(last_merge_row.value).date()
+                else:
+                    # First run: set today as last merge, next merge in 7 days
+                    last_merge_date = now_bj.date()
+                    db.add(Settings(key="last_weekly_merge", value=now_bj.date().isoformat()))
+                    db.commit()
+            finally:
+                db.close()
+
+            next_merge_date = last_merge_date + timedelta(days=MERGE_INTERVAL_DAYS)
+            next_merge_dt = datetime.combine(next_merge_date, datetime.min.time()).replace(tzinfo=TZ_EAST8)
+
+            if now_bj >= next_merge_dt:
+                wait_seconds = 0
+            else:
+                wait_seconds = (next_merge_dt - now_bj).total_seconds()
+
             logger.info("[daily_merge_cron] Next run in %.0f seconds", wait_seconds)
             await asyncio.sleep(wait_seconds)
 
-            logger.info("[daily_merge_cron] Starting midnight merge")
+            # Re-check after sleep: manual merge may have reset the countdown
+            db = SessionLocal()
+            try:
+                recheck_row = db.query(Settings).filter(Settings.key == "last_weekly_merge").first()
+                if recheck_row:
+                    recheck_date = datetime.fromisoformat(recheck_row.value).date()
+                    recheck_next = recheck_date + timedelta(days=MERGE_INTERVAL_DAYS)
+                    if datetime.now(TZ_EAST8).date() < recheck_next:
+                        logger.info("[daily_merge_cron] Skipped — manual merge already happened")
+                        continue
+            finally:
+                db.close()
+
+            logger.info("[daily_merge_cron] Starting weekly merge")
             db = SessionLocal()
             try:
                 assistants = (
@@ -953,11 +1341,25 @@ async def daily_merge_cron() -> None:
             service = SummaryService(SessionLocal)
             for aid in assistant_ids:
                 try:
-                    service.daily_merge_to_longterm(aid)
+                    # daily_merge_to_longterm 内部会调外部 API (拿 summary), 同步 blocking IO
+                    # 必须 to_thread 隔离, 否则整个 event loop 被卡住, 所有 HTTP 请求 / TG webhook 全部排队
+                    await asyncio.to_thread(service.daily_merge_to_longterm, aid)
                 except Exception:
                     logger.exception("[daily_merge_cron] Failed for assistant_id=%s", aid)
 
-            logger.info("[daily_merge_cron] Completed for %d assistants", len(assistant_ids))
+            # Record merge date
+            db = SessionLocal()
+            try:
+                row = db.query(Settings).filter(Settings.key == "last_weekly_merge").first()
+                if row:
+                    row.value = datetime.now(TZ_EAST8).date().isoformat()
+                else:
+                    db.add(Settings(key="last_weekly_merge", value=datetime.now(TZ_EAST8).date().isoformat()))
+                db.commit()
+            finally:
+                db.close()
+
+            logger.info("[daily_merge_cron] Weekly merge completed for %d assistants", len(assistant_ids))
         except asyncio.CancelledError:
             break
         except Exception:

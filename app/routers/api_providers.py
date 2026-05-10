@@ -52,6 +52,39 @@ def _to_item(row: ApiProvider) -> ProviderItem:
     )
 
 
+@router.get("/providers/oauth-status")
+def oauth_status(
+    auth_type: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return OAuth token expiry status for display.
+
+    Pass `auth_type=oauth_claude` / `oauth_codex` to query a specific provider.
+    Without it, falls back to the first OAuth provider in DB (legacy behavior).
+    """
+    from app.services.chat.oauth_helper import get_token_status
+
+    query = db.query(ApiProvider)
+    if auth_type:
+        # Accept legacy 'oauth_token' as equivalent to 'oauth_claude'
+        if auth_type == "oauth_claude":
+            query = query.filter(ApiProvider.auth_type.in_(("oauth_token", "oauth_claude")))
+        else:
+            query = query.filter(ApiProvider.auth_type == auth_type)
+    else:
+        query = query.filter(ApiProvider.auth_type.in_(("oauth_token", "oauth_claude", "oauth_codex")))
+    provider = query.first()
+    if not provider:
+        return {"found": False}
+    status = get_token_status(provider.id)
+    # If cache empty, try to populate it
+    if status["expires_at"] is None:
+        from app.services.chat.oauth_helper import ensure_valid_token
+        ensure_valid_token(db, provider)
+        status = get_token_status(provider.id)
+    return {"found": True, **status}
+
+
 @router.get("/providers", response_model=ProvidersResponse)
 def list_providers(db: Session = Depends(get_db)) -> ProvidersResponse:
     rows = db.query(ApiProvider).order_by(ApiProvider.id.asc()).all()

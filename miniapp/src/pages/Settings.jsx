@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronLeft, ChevronRight, Server, Mic2, MessageSquare, Database, Timer, Hash, BookOpen, Repeat } from "lucide-react";
+import { ChevronLeft, ChevronRight, Server, Mic2, MessageSquare, Database, Timer, Hash, BookOpen, Repeat, Shield, Radio, Hourglass } from "lucide-react";
 import { apiFetch } from "../utils/api";
 
 const S = {
@@ -77,16 +77,20 @@ export default function Settings() {
   const [maxToolRounds, setMaxToolRounds] = useState(() =>
     parseInt(localStorage.getItem("max_tool_rounds") || "15")
   );
+  const [toolExpireHours, setToolExpireHours] = useState(() =>
+    parseInt(localStorage.getItem("tool_result_expire_hours") || "24")
+  );
   const miscMounted = useRef(false);
 
   // API settings
   const [retainBudget, setRetainBudget] = useState(8000);
   const [triggerThreshold, setTriggerThreshold] = useState(16000);
-  const [sbLongterm, setSbLongterm] = useState(800);
-  const [sbDaily, setSbDaily] = useState(800);
+  const [sbLongterm, setSbLongterm] = useState(2000);
+  const [sbDaily, setSbDaily] = useState(2000);
   const [sbRecent, setSbRecent] = useState(2000);
   const [budgetLoaded, setBudgetLoaded] = useState(false);
   const [budgetSaving, setBudgetSaving] = useState(false);
+  const [mergeInfo, setMergeInfo] = useState(null);
 
   const [toast, setToast] = useState(null);
 
@@ -106,6 +110,7 @@ export default function Settings() {
         setBudgetLoaded(true);
       })
       .catch(() => setBudgetLoaded(true));
+    apiFetch("/api/settings/merge-info").then(setMergeInfo).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -124,6 +129,8 @@ export default function Settings() {
         .then((d) => { const v = d.max_count || 8; setShortMsgMax(v); localStorage.setItem("short_msg_max", String(v)); }),
       apiFetch("/api/settings/max-tool-rounds")
         .then((d) => { const v = d.max_rounds || 15; setMaxToolRounds(v); localStorage.setItem("max_tool_rounds", String(v)); }),
+      apiFetch("/api/settings/tool-result-expire-hours")
+        .then((d) => { const v = d.hours || 24; setToolExpireHours(v); localStorage.setItem("tool_result_expire_hours", String(v)); }),
     ]).finally(() => { miscMounted.current = true; });
   }, []);
 
@@ -144,6 +151,15 @@ export default function Settings() {
       body: { max_rounds: maxToolRounds },
     }).catch(() => {});
   }, [maxToolRounds]);
+
+  useEffect(() => {
+    if (!miscMounted.current) return;
+    localStorage.setItem("tool_result_expire_hours", String(toolExpireHours));
+    apiFetch("/api/settings/tool-result-expire-hours", {
+      method: "PUT",
+      body: { hours: toolExpireHours },
+    }).catch(() => {});
+  }, [toolExpireHours]);
 
   const saveBudget = async () => {
     setBudgetSaving(true);
@@ -204,13 +220,34 @@ export default function Settings() {
             hint="TTS · STT"
             onClick={() => navigate("/settings/voice")}
           />
+          <Divider />
+          <RowLink
+            icon={<Shield size={18} style={{ color: S.text }} />}
+            label="安全设置"
+            hint="IP 白名单 · 两步验证"
+            onClick={() => navigate("/settings/security")}
+          />
+          <Divider />
+          <RowLink
+            icon={<BookOpen size={18} style={{ color: S.text }} />}
+            label="提示词"
+            hint="长/短消息 · 主动消息 · 触发器"
+            onClick={() => navigate("/settings/prompts")}
+          />
         </div>
 
-        {/* Proactive message entry */}
+        {/* Channel + Proactive */}
         <div
           className="rounded-[20px] overflow-hidden"
           style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}
         >
+          <RowLink
+            icon={<Radio size={18} style={{ color: S.text }} />}
+            label="渠道管理"
+            hint="微信连接"
+            onClick={() => navigate("/settings/channels")}
+          />
+          <Divider />
           <RowLink
             icon={<MessageSquare size={18} style={{ color: S.text }} />}
             label="主动发消息"
@@ -274,6 +311,23 @@ export default function Settings() {
               <span className="text-[12px]" style={{ color: S.textMuted }}>轮</span>
             </div>
           </div>
+          <Divider />
+          <div className="flex items-center gap-4 px-4 py-4">
+            <div
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+              style={{ boxShadow: "var(--icon-inset)", background: S.bg }}
+            >
+              <Hourglass size={18} style={{ color: S.text }} />
+            </div>
+            <div className="flex-1">
+              <div className="text-[15px] font-semibold" style={{ color: S.text }}>工具结果过期</div>
+              <div className="text-[11px]" style={{ color: S.textMuted }}>完整工具内容保留时长</div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <NumberInput value={toolExpireHours} onChange={setToolExpireHours} min={1} max={168} />
+              <span className="text-[12px]" style={{ color: S.textMuted }}>时</span>
+            </div>
+          </div>
         </div>
 
         {/* Context + Summary budget */}
@@ -334,8 +388,8 @@ export default function Settings() {
               </div>
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <div className="text-[13px] font-medium" style={{ color: S.text }}>近期日常 (tokens)</div>
-                  <div className="text-[10px]" style={{ color: S.textMuted }}>当天的合并回顾</div>
+                  <div className="text-[13px] font-medium" style={{ color: S.text }}>近期记忆 (tokens)</div>
+                  <div className="text-[10px]" style={{ color: S.textMuted }}>7天内的合并回顾</div>
                 </div>
                 <NumberInput value={sbDaily} onChange={setSbDaily} min={200} max={5000} />
               </div>
@@ -346,6 +400,18 @@ export default function Settings() {
                 </div>
                 <NumberInput value={sbRecent} onChange={setSbRecent} min={500} max={20000} />
               </div>
+
+              {mergeInfo && (
+                <div
+                  className="mb-4 rounded-[12px] px-3 py-2 text-[11px]"
+                  style={{ background: "rgba(136,136,160,0.06)", color: S.textMuted }}
+                >
+                  近期记忆每 {mergeInfo.interval_days} 天合并进长期记忆
+                  {mergeInfo.days_left > 0
+                    ? ` · ${mergeInfo.days_left} 天后合并 (${mergeInfo.next_merge})`
+                    : " · 今天将合并"}
+                </div>
+              )}
 
               <button
                 className="w-full rounded-[14px] py-3 text-[14px] font-bold text-white"

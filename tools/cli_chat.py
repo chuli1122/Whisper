@@ -222,7 +222,7 @@ def stream_chat(token: str, session_id: int, message: str | list | None,
         if "content" in data:
             if not has_content:
                 # Clear typing indicator line, write name prefix
-                sys.stdout.write(f"\r\033[2K{BOLD}阿澄{RESET}  ")
+                sys.stdout.write(f"\r\033[2K{BOLD}助手A{RESET}  ")
                 has_content = True
             sys.stdout.write(data["content"])
             sys.stdout.flush()
@@ -292,7 +292,7 @@ def main():
     # Clear screen and print header at top
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
-    print(f"{DIM}阿澄的终端 | 会话 #{session_id} | /quit 退出 | /img <路径> 发图片{RESET}")
+    print(f"{DIM}助手A的终端 | 会话 #{session_id} | /quit 退出 | /img <路径> 发图片{RESET}")
     print(f"{DIM}本地工具: run_bash, read_file, write_file{RESET}")
     print()
 
@@ -316,11 +316,11 @@ def main():
         # Erase input area (sep + input line), show as sent message with name
         sys.stdout.write("\033[A\033[2K\033[A\033[2K")
         sys.stdout.flush()
-        print(f"{BOLD}初礼{RESET}  {user_input}")
+        print(f"{BOLD}用户{RESET}  {user_input}")
         print()
 
         # Show typing indicator
-        sys.stdout.write(f"{BOLD}阿澄{RESET}  {DIM}...{RESET}")
+        sys.stdout.write(f"{BOLD}助手A{RESET}  {DIM}...{RESET}")
         sys.stdout.flush()
 
         # /img 命令

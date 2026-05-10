@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import uuid
-from pathlib import Path
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from app.services.media_service import make_signed_url, save_image
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent.parent.parent / "static" / "uploads"
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 @router.post("/upload-image")
-async def upload_image(file: UploadFile) -> dict:
+async def upload_image(file: UploadFile, request: Request) -> dict:
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="只支持图片格式 (jpeg/png/gif/webp)")
 
@@ -25,8 +23,8 @@ async def upload_image(file: UploadFile) -> dict:
     if ext not in {"jpg", "jpeg", "png", "gif", "webp"}:
         ext = "jpg"
 
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    (UPLOAD_DIR / filename).write_bytes(data)
+    filename = save_image(data, ext)
+    base_url = str(request.base_url).rstrip("/")
+    url = make_signed_url(filename, base_url)
 
-    return {"url": f"/static/uploads/{filename}"}
+    return {"url": url, "media_ref": f"media:{filename}"}

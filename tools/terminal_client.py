@@ -15,7 +15,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 
 # Add NVIDIA CUDA libs to PATH so ctranslate2/faster-whisper can find cublas
 _nvidia_libs = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
@@ -87,14 +86,6 @@ def execute_tool(name: str, arguments: dict) -> dict:
         return scroll_screen(arguments.get("clicks", -3), arguments.get("x"), arguments.get("y"))
     elif name == "transcribe":
         return transcribe_audio(arguments.get("audio_base64", ""), arguments.get("file_name", "voice.ogg"))
-    elif name == "toy_control":
-        return toy_control(
-            arguments.get("action", ""),
-            arguments.get("intensity", 0.5),
-            arguments.get("index"),
-            arguments.get("pattern"),
-            arguments.get("duration", 10),
-        )
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -303,183 +294,6 @@ def transcribe_audio(audio_base64: str, file_name: str = "voice.ogg") -> dict:
             os.unlink(tmp_path)
         except OSError:
             pass
-
-
-# ── Toy control (Buttplug.io / Intiface Central) ──
-
-_bp_client = None
-_bp_connected = False
-_bp_loop = None
-_bp_thread = None
-
-
-def _get_bp_loop():
-    """Get or create a dedicated event loop for buttplug async operations."""
-    global _bp_loop, _bp_thread
-    if _bp_loop is None or not _bp_loop.is_running():
-        _bp_loop = asyncio.new_event_loop()
-        _bp_thread = threading.Thread(target=_bp_loop.run_forever, daemon=True)
-        _bp_thread.start()
-    return _bp_loop
-
-
-def _describe_device(idx, device):
-    """Return a dict describing a device and its actuators."""
-    actuators = []
-    try:
-        for i, act in enumerate(device.actuators):
-            actuators.append({
-                "index": i,
-                "type": type(act).__name__,
-                "description": str(act),
-                "step_count": getattr(act, "step_count", None),
-            })
-    except Exception:
-        pass
-    return {"device_index": idx, "name": device.name, "actuators": actuators}
-
-
-async def _async_toy_control(action, intensity, index, pattern, duration):
-    global _bp_client, _bp_connected
-
-    if action == "connect":
-        try:
-            from buttplug import Client, WebsocketConnector
-        except ImportError:
-            return {"error": "缺少依赖: pip install buttplug-py"}
-
-        # Disconnect existing client if any
-        if _bp_client and _bp_connected:
-            try:
-                await _bp_client.disconnect()
-            except Exception:
-                pass
-            _bp_connected = False
-
-        _bp_client = Client("Acheng")
-        connector = WebsocketConnector("ws://127.0.0.1:12345")
-        try:
-            await _bp_client.connect(connector)
-        except Exception as e:
-            return {"error": f"连接 Intiface Central 失败 (确保已启动): {e}"}
-
-        await _bp_client.start_scanning()
-        await asyncio.sleep(3)
-        await _bp_client.stop_scanning()
-        _bp_connected = True
-
-        devices = [_describe_device(i, d) for i, d in _bp_client.devices.items()]
-        print(f"  {GREEN}已连接 Intiface Central, {len(devices)} 个设备{RESET}")
-        return {"status": "connected", "devices": devices}
-
-    if not _bp_client or not _bp_connected:
-        return {"error": "未连接，请先 connect"}
-
-    if action == "list":
-        devices = [_describe_device(i, d) for i, d in _bp_client.devices.items()]
-        return {"status": "ok", "devices": devices}
-
-    if action == "vibrate":
-        if not _bp_client.devices:
-            return {"error": "没有已连接的设备"}
-        intensity = max(0.0, min(1.0, float(intensity)))
-        controlled = []
-        for dev_idx, device in _bp_client.devices.items():
-            try:
-                if index is not None:
-                    # Control specific actuator by index
-                    idx = int(index)
-                    if idx < len(device.actuators):
-                        await device.actuators[idx].command(intensity)
-                        controlled.append(f"{device.name}[{idx}]")
-                else:
-                    # Control all actuators
-                    for i, act in enumerate(device.actuators):
-                        await act.command(intensity)
-                    controlled.append(device.name)
-            except Exception as e:
-                controlled.append(f"{device.name}: error {e}")
-        print(f"  {DIM}震动 {intensity:.0%}: {', '.join(controlled)}{RESET}")
-        return {"status": "vibrating", "intensity": intensity, "devices": controlled}
-
-    if action == "stop":
-        for device in _bp_client.devices.values():
-            try:
-                await device.stop()
-            except Exception:
-                pass
-        print(f"  {DIM}已停止所有设备{RESET}")
-        return {"status": "stopped"}
-
-    if action == "pattern":
-        if not _bp_client.devices:
-            return {"error": "没有已连接的设备"}
-        duration = max(1, min(120, int(duration)))
-        pattern = pattern or "wave"
-
-        async def _run_pattern():
-            import math
-            elapsed = 0.0
-            step = 0.2  # update interval
-            while elapsed < duration:
-                t = elapsed / duration
-                if pattern == "pulse":
-                    val = 1.0 if int(elapsed / 0.5) % 2 == 0 else 0.0
-                elif pattern == "wave":
-                    val = (math.sin(t * math.pi * 4) + 1) / 2
-                elif pattern == "escalate":
-                    val = min(1.0, t * 1.2)
-                else:
-                    val = 0.5
-                for device in _bp_client.devices.values():
-                    try:
-                        if index is not None:
-                            idx = int(index)
-                            if idx < len(device.actuators):
-                                await device.actuators[idx].command(val)
-                        else:
-                            for act in device.actuators:
-                                await act.command(val)
-                    except Exception:
-                        pass
-                await asyncio.sleep(step)
-                elapsed += step
-            # Stop after pattern
-            for device in _bp_client.devices.values():
-                try:
-                    await device.stop()
-                except Exception:
-                    pass
-
-        await _run_pattern()
-        print(f"  {DIM}模式 {pattern} 完成 ({duration}s){RESET}")
-        return {"status": "pattern_done", "pattern": pattern, "duration": duration}
-
-    if action == "disconnect":
-        try:
-            await _bp_client.disconnect()
-        except Exception:
-            pass
-        _bp_connected = False
-        print(f"  {DIM}已断开 Intiface Central{RESET}")
-        return {"status": "disconnected"}
-
-    return {"error": f"未知 action: {action}"}
-
-
-def toy_control(action, intensity=0.5, index=None, pattern=None, duration=10):
-    """Control Bluetooth toy via Intiface Central / Buttplug.io."""
-    print(f"  {DIM}[玩具] action={action} intensity={intensity} index={index}{RESET}")
-    try:
-        loop = _get_bp_loop()
-        future = asyncio.run_coroutine_threadsafe(
-            _async_toy_control(action, intensity, index, pattern, duration), loop
-        )
-        return future.result(timeout=max(30, duration + 5) if action == "pattern" else 30)
-    except TimeoutError:
-        return {"error": "操作超时"}
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # ── WebSocket client ──

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  ChevronLeft, Plus, X, Check, Save, Camera,
-  Maximize2, Minimize2, FileText, GripVertical, History, Trash2,
+  ChevronLeft, Plus, X, Check, Save, Camera, Pencil,
+  Maximize2, Minimize2, FileText, GripVertical, History, Trash2, Layers,
 } from "lucide-react";
 import {
   DndContext, closestCenter, PointerSensor, TouchSensor,
@@ -45,7 +45,7 @@ function NmInput({ label, value, onChange, placeholder }) {
   );
 }
 
-function NmTextareaWithExpand({ label, value, onChange, placeholder, rows, onExpand, onHistory }) {
+function NmTextareaWithExpand({ label, value, onChange, placeholder, rows, onExpand, onHistory, onCandidates }) {
   const importRef = useRef(null);
   const handleImportFile = (e) => {
     const file = e.target.files?.[0];
@@ -63,6 +63,16 @@ function NmTextareaWithExpand({ label, value, onChange, placeholder, rows, onExp
           {label}
         </label>
         <div className="flex items-center gap-2">
+          {onCandidates && (
+            <button
+              className="flex h-7 w-7 items-center justify-center rounded-full"
+              style={{ boxShadow: "var(--card-shadow-sm)", background: S.bg }}
+              onClick={onCandidates}
+              title="碎片"
+            >
+              <Layers size={13} style={{ color: S.textMuted }} />
+            </button>
+          )}
           {onHistory && (
             <button
               className="flex h-7 w-7 items-center justify-center rounded-full"
@@ -97,6 +107,9 @@ function NmTextareaWithExpand({ label, value, onChange, placeholder, rows, onExp
         className="w-full rounded-[14px] px-4 py-3 text-[14px] resize-none outline-none"
         style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
       />
+      <div className="mt-1 text-right text-[10px]" style={{ color: S.textMuted }}>
+        {(value || "").length} 字
+      </div>
     </div>
   );
 }
@@ -826,6 +839,147 @@ function WorldBookMountTab({ ruleSetIds, onChange, allBooks }) {
   );
 }
 
+// ── Candidates Overlay ──
+function CandidatesOverlay({ blockType, assistantId, onClose }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editingId, setEditingId] = useState(null);
+  const [editContent, setEditContent] = useState("");
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+
+  const load = () => {
+    apiFetch(`/api/core-blocks/candidates?assistant_id=${assistantId}&block_type=${blockType}`)
+      .then((data) => setItems(data.candidates || data || []))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, [assistantId, blockType]);
+
+  const startEdit = (item) => { setEditingId(item.id); setEditContent(item.content); };
+  const cancelEdit = () => { setEditingId(null); setEditContent(""); };
+  const saveEdit = async (id) => {
+    try {
+      await apiFetch(`/api/core-blocks/candidates/${id}`, { method: "PUT", body: { content: editContent } });
+      setEditingId(null);
+      load();
+    } catch {}
+  };
+  const doDelete = async (id) => {
+    try {
+      await apiFetch(`/api/core-blocks/candidates/${id}`, { method: "DELETE" });
+      setDeleteConfirm(null);
+      load();
+    } catch {}
+  };
+
+  const statusLabel = { pending: "待定", adopted: "采纳", duplicate: "重复" };
+  const statusBg = { pending: "#f0ece4", adopted: "#dff0e4", duplicate: "#ececec" };
+  const statusColor = { pending: S.textMuted, adopted: "#4a9b6e", duplicate: "#999" };
+
+  return (
+    <div className="fixed inset-0 z-[200] flex flex-col" style={{ background: S.bg }}>
+      <div
+        className="flex shrink-0 items-center justify-between px-5 py-4"
+        style={{ paddingTop: "max(1rem, env(safe-area-inset-top))" }}
+      >
+        <span className="text-[15px] font-bold" style={{ color: S.text }}>
+          碎片 ({blockType})
+        </span>
+        <button
+          className="flex h-10 w-10 items-center justify-center rounded-full"
+          style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+          onClick={onClose}
+        >
+          <Minimize2 size={18} style={{ color: S.accentDark }} />
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-5 pb-10">
+        {loading ? (
+          <div className="flex h-40 items-center justify-center">
+            <div className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent" style={{ borderColor: `${S.accentDark} transparent ${S.accentDark} ${S.accentDark}` }} />
+          </div>
+        ) : items.length === 0 ? (
+          <p className="py-16 text-center text-[13px]" style={{ color: S.textMuted }}>暂无碎片</p>
+        ) : (
+          items.map((item, i) => (
+            <div
+              key={item.id || i}
+              className="mb-2.5 rounded-[18px] p-3.5"
+              style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+            >
+              <div className="flex items-start gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <span className="text-[11px] font-medium" style={{ color: S.accentDark }}>#{item.id}</span>
+                    <span className="inline-block rounded-full px-1.5 py-0.5 text-[9px] font-medium" style={{ background: statusBg[item.status] || "#ececec", color: statusColor[item.status] || S.textMuted }}>
+                      {statusLabel[item.status] || item.status}{item.occurrence_count > 1 ? ` ×${item.occurrence_count}` : ""}
+                    </span>
+                    {item.created_at && (
+                      <span className="text-[10px]" style={{ color: S.textMuted }}>
+                        {new Date(item.created_at).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                    )}
+                  </div>
+                  {editingId === item.id ? (
+                    <div>
+                      <textarea
+                        value={editContent}
+                        onChange={(e) => setEditContent(e.target.value)}
+                        rows={3}
+                        className="w-full rounded-[10px] px-3 py-2 text-[12px] resize-none outline-none"
+                        style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                      />
+                      <div className="flex justify-end gap-2 mt-1.5">
+                        <button onClick={cancelEdit} className="rounded-full px-3 py-1 text-[11px]" style={{ color: S.textMuted, boxShadow: "var(--card-shadow-sm)" }}>取消</button>
+                        <button onClick={() => saveEdit(item.id)} className="rounded-full px-3 py-1 text-[11px] font-medium text-white" style={{ background: "var(--accent)" }}>保存</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="whitespace-pre-wrap text-[12px] leading-relaxed" style={{ color: S.text }}>
+                      {item.content}
+                    </p>
+                  )}
+                </div>
+                {editingId !== item.id && (
+                  <div className="flex shrink-0 flex-col items-center gap-1 mt-0.5">
+                    <button
+                      className="flex h-6 w-6 items-center justify-center rounded-full"
+                      style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                      onClick={() => startEdit(item)}
+                    >
+                      <Pencil size={11} style={{ color: S.accentDark }} />
+                    </button>
+                    <button
+                      className="flex h-6 w-6 items-center justify-center rounded-full"
+                      style={{ background: S.bg, boxShadow: "var(--card-shadow-sm)" }}
+                      onClick={() => setDeleteConfirm(item.id)}
+                    >
+                      <Trash2 size={11} style={{ color: "#b5454a" }} />
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+      {/* Delete confirm */}
+      {deleteConfirm && (
+        <div className="fixed inset-0 z-[210] flex items-center justify-center" style={{ background: "rgba(0,0,0,0.35)" }} onClick={() => setDeleteConfirm(null)}>
+          <div className="w-[280px] rounded-[22px] p-5" style={{ background: S.bg, boxShadow: "var(--card-shadow)" }} onClick={(e) => e.stopPropagation()}>
+            <p className="mb-1 text-center text-[16px] font-bold" style={{ color: S.text }}>删除碎片</p>
+            <p className="mb-4 text-center text-[13px]" style={{ color: S.textMuted }}>确定要删除这条碎片吗？</p>
+            <div className="flex gap-3">
+              <button className="flex-1 rounded-[16px] py-3 text-[15px] font-semibold" style={{ boxShadow: "var(--card-shadow-sm)", color: S.text }} onClick={() => setDeleteConfirm(null)}>取消</button>
+              <button className="flex-1 rounded-[16px] py-3 text-[15px] font-semibold text-white" style={{ background: "#ef4444", boxShadow: "4px 4px 10px rgba(239,68,68,0.4)" }} onClick={() => doDelete(deleteConfirm)}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main page ──
 
 export default function AssistantEdit() {
@@ -846,6 +1000,20 @@ export default function AssistantEdit() {
   const [personaBlockId, setPersonaBlockId] = useState(null);
   const [ruleSetIds, setRuleSetIds] = useState([]);
 
+  const [emotionKeywords, setEmotionKeywords] = useState({});
+  const [moodWeights, setMoodWeights] = useState({});
+  const [emotionLoaded, setEmotionLoaded] = useState(false);
+  const [emotionSaving, setEmotionSaving] = useState(false);
+  const [reflectionThreshold, setReflectionThreshold] = useState(30);
+  const [reflectionEnabled, setReflectionEnabled] = useState(true);
+  const [coreBlocksThreshold, setCoreBlocksThreshold] = useState(10);
+  const [coreBlocksEnabled, setCoreBlocksEnabled] = useState(true);
+  const [thresholdsLoaded, setThresholdsLoaded] = useState(false);
+
+  const [memo, setMemo] = useState("");
+  const [memoLoaded, setMemoLoaded] = useState(false);
+  const [memoSaving, setMemoSaving] = useState(false);
+
   const [presets, setPresets] = useState([]);
   const [allBooks, setAllBooks] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -855,6 +1023,7 @@ export default function AssistantEdit() {
   const [humanFullscreen, setHumanFullscreen] = useState(false);
   const [personaFullscreen, setPersonaFullscreen] = useState(false);
   const [historyBlockType, setHistoryBlockType] = useState(null);
+  const [candidatesBlockType, setCandidatesBlockType] = useState(null);
   const [historyItems, setHistoryItems] = useState([]);
 
   const fileInputRef = useRef(null);
@@ -996,6 +1165,27 @@ export default function AssistantEdit() {
         setPersonaBlockId(created.id);
       }
 
+      // Save emotion config if loaded
+      if (emotionLoaded) {
+        await apiFetch("/api/emotion-keywords", {
+          method: "PUT",
+          body: { keywords: emotionKeywords, weights: moodWeights },
+        });
+      }
+
+      // Save threshold settings if loaded
+      if (thresholdsLoaded) {
+        await apiFetch("/api/threshold-settings", {
+          method: "PUT",
+          body: {
+            reflection_threshold: reflectionThreshold,
+            reflection_enabled: reflectionEnabled,
+            core_blocks_auto_rewrite_threshold: coreBlocksThreshold,
+            core_blocks_enabled: coreBlocksEnabled,
+          },
+        });
+      }
+
       showToast("已保存");
     } catch (e) {
       showToast("保存失败: " + e.message);
@@ -1004,10 +1194,81 @@ export default function AssistantEdit() {
     }
   };
 
+  // ── Emotion keywords helpers ──
+  const loadEmotionKeywords = async () => {
+    try {
+      const data = await apiFetch("/api/emotion-keywords");
+      setEmotionKeywords(data.keywords || {});
+      setMoodWeights(data.weights || {});
+      setEmotionLoaded(true);
+    } catch {
+      showToast("加载情绪关键词失败");
+    }
+  };
+
+  const saveEmotionKeywords = async () => {
+    setEmotionSaving(true);
+    try {
+      await apiFetch("/api/emotion-keywords", {
+        method: "PUT",
+        body: { keywords: emotionKeywords, weights: moodWeights },
+      });
+      showToast("已保存");
+    } catch (e) {
+      showToast("保存失败: " + e.message);
+    } finally {
+      setEmotionSaving(false);
+    }
+  };
+
+  const loadThresholds = async () => {
+    try {
+      const data = await apiFetch("/api/threshold-settings");
+      setReflectionThreshold(data.reflection_threshold);
+      setReflectionEnabled(data.reflection_enabled);
+      setCoreBlocksThreshold(data.core_blocks_auto_rewrite_threshold);
+      setCoreBlocksEnabled(data.core_blocks_enabled);
+      setThresholdsLoaded(true);
+    } catch {}
+  };
+
+  const loadMemo = async () => {
+    try {
+      const data = await apiFetch("/api/settings/model-memo");
+      setMemo(data.memo || "");
+      setMemoLoaded(true);
+    } catch {
+      showToast("加载备忘录失败");
+    }
+  };
+
+  const saveMemo = async () => {
+    setMemoSaving(true);
+    try {
+      await apiFetch("/api/settings/model-memo", {
+        method: "PUT",
+        body: { memo },
+      });
+      showToast("已保存");
+    } catch (e) {
+      showToast("保存失败: " + e.message);
+    } finally {
+      setMemoSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab === "emotion" && !emotionLoaded) loadEmotionKeywords();
+    if (tab === "basic" && !thresholdsLoaded) loadThresholds();
+    if (tab === "memo" && !memoLoaded) loadMemo();
+  }, [tab]);
+
   const tabs = [
     { key: "basic", label: "基础设置" },
-    { key: "about", label: "Core Blocks" },
+    { key: "about", label: "核心块" },
     { key: "books", label: "世界书" },
+    { key: "emotion", label: "情绪关键词" },
+    { key: "memo", label: "备忘录" },
   ];
 
   return (
@@ -1166,6 +1427,62 @@ export default function AssistantEdit() {
               />
             </div>
 
+            {/* Threshold settings */}
+            <div
+              className="mb-4 rounded-[20px] p-5 space-y-4"
+              style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}
+            >
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[14px] font-semibold" style={{ color: S.text }}>自动反思</div>
+                  <div className="text-[11px]" style={{ color: S.textMuted }}>新记忆累积后自动整理</div>
+                </div>
+                <button
+                  onClick={() => setReflectionEnabled(!reflectionEnabled)}
+                  className="relative flex h-7 w-12 shrink-0 items-center rounded-full"
+                  style={{ boxShadow: "var(--inset-shadow)", background: reflectionEnabled ? "var(--accent)" : S.bg, transition: "background 0.2s" }}
+                >
+                  <span className="absolute h-5 w-5 rounded-full" style={{ left: reflectionEnabled ? "calc(100% - 22px)" : "2px", background: "white", boxShadow: "2px 2px 5px rgba(174,176,182,0.5)", transition: "left 0.2s ease" }} />
+                </button>
+              </div>
+              {reflectionEnabled && (
+                <div className="flex items-center justify-between">
+                  <span className="text-[12px]" style={{ color: S.textMuted }}>触发阈值（条）</span>
+                  <input
+                    type="number" min="5" value={reflectionThreshold}
+                    onChange={e => setReflectionThreshold(parseInt(e.target.value, 10) || 30)}
+                    className="w-20 rounded-[10px] py-2 text-center text-[13px] font-bold outline-none"
+                    style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                  />
+                </div>
+              )}
+              <div className="h-px" style={{ background: "rgba(136,136,160,0.15)" }} />
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[14px] font-semibold" style={{ color: S.text }}>Core Blocks 合并</div>
+                  <div className="text-[11px]" style={{ color: S.textMuted }}>碎片累积后自动重写</div>
+                </div>
+                <button
+                  onClick={() => setCoreBlocksEnabled(!coreBlocksEnabled)}
+                  className="relative flex h-7 w-12 shrink-0 items-center rounded-full"
+                  style={{ boxShadow: "var(--inset-shadow)", background: coreBlocksEnabled ? "var(--accent)" : S.bg, transition: "background 0.2s" }}
+                >
+                  <span className="absolute h-5 w-5 rounded-full" style={{ left: coreBlocksEnabled ? "calc(100% - 22px)" : "2px", background: "white", boxShadow: "2px 2px 5px rgba(174,176,182,0.5)", transition: "left 0.2s ease" }} />
+                </button>
+              </div>
+              {coreBlocksEnabled && (
+                <div className="flex items-center justify-between">
+                  <span className="text-[12px]" style={{ color: S.textMuted }}>触发阈值（条）</span>
+                  <input
+                    type="number" min="3" value={coreBlocksThreshold}
+                    onChange={e => setCoreBlocksThreshold(parseInt(e.target.value, 10) || 10)}
+                    className="w-20 rounded-[10px] py-2 text-center text-[13px] font-bold outline-none"
+                    style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                  />
+                </div>
+              )}
+            </div>
+
             {/* Model Presets */}
             <div
               className="rounded-[20px] p-4"
@@ -1192,6 +1509,7 @@ export default function AssistantEdit() {
                 rows={7}
                 onExpand={() => setHumanFullscreen(true)}
                 onHistory={() => openHistory("human")}
+                onCandidates={() => setCandidatesBlockType("human")}
               />
             </div>
             <div
@@ -1206,6 +1524,7 @@ export default function AssistantEdit() {
                 rows={7}
                 onExpand={() => setPersonaFullscreen(true)}
                 onHistory={() => openHistory("persona")}
+                onCandidates={() => setCandidatesBlockType("persona")}
               />
             </div>
           </>
@@ -1222,6 +1541,168 @@ export default function AssistantEdit() {
               allBooks={allBooks}
             />
           </div>
+        )}
+
+        {tab === "emotion" && (
+          <>
+            {/* Keywords card */}
+            <div className="mb-4 rounded-[20px] p-4" style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}>
+              <label className="mb-3 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>
+                情绪关键词
+              </label>
+              {Object.keys(emotionKeywords).length === 0 && (
+                <div className="py-3 text-center text-[12px]" style={{ color: S.textMuted }}>加载中...</div>
+              )}
+              {Object.entries(emotionKeywords).map(([mood, keywords]) => (
+                <div key={mood} className="mb-3">
+                  <span className="mb-1 block text-[11px] font-semibold" style={{ color: S.accentDark }}>{mood}</span>
+                  <textarea
+                    value={Array.isArray(keywords) ? keywords.join(", ") : keywords}
+                    onChange={(e) => {
+                      // Keep raw string during editing, don't split yet
+                      setEmotionKeywords((prev) => ({
+                        ...prev,
+                        [mood]: e.target.value,
+                      }));
+                    }}
+                    onBlur={(e) => {
+                      // On blur: normalize to array, auto-add ", " after each keyword
+                      const parts = e.target.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+                      setEmotionKeywords((prev) => ({
+                        ...prev,
+                        [mood]: parts,
+                      }));
+                    }}
+                    className="w-full rounded-[14px] px-4 py-3 text-[13px] outline-none resize-none overflow-hidden"
+                    style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                    placeholder="逗号分隔关键词..."
+                    rows={1}
+                    onInput={(e) => { e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px"; }}
+                  />
+                </div>
+              ))}
+            </div>
+
+            {/* Weights card */}
+            <div className="mb-4 rounded-[20px] p-4" style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}>
+              <label className="mb-3 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>
+                情绪权重
+              </label>
+              {Object.keys(moodWeights).length === 0 && (
+                <div className="py-3 text-center text-[12px]" style={{ color: S.textMuted }}>无权重配置</div>
+              )}
+              {Object.entries(moodWeights).map(([mood, klassMap]) => (
+                <div key={mood} className="mb-4">
+                  <span className="mb-1.5 block text-[11px] font-semibold" style={{ color: S.accentDark }}>{mood}</span>
+                  <div className="space-y-1.5">
+                    {Object.entries(klassMap).map(([klass, weight]) => (
+                      <div key={klass} className="flex items-center gap-2">
+                        <select
+                          value={klass}
+                          onChange={(e) => {
+                            const newKlass = e.target.value;
+                            if (newKlass === klass) return;
+                            setMoodWeights((prev) => {
+                              const updated = { ...prev[mood] };
+                              const val = updated[klass];
+                              delete updated[klass];
+                              updated[newKlass] = val;
+                              return { ...prev, [mood]: updated };
+                            });
+                          }}
+                          className="w-28 rounded-[10px] px-3 py-2 text-[12px] outline-none appearance-none"
+                          style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                        >
+                          <option value="">选择分类</option>
+                          {["identity","relationship","bond","conflict","fact","preference","health","task","ephemeral","other"].map((k) => (
+                            <option key={k} value={k}>{k}</option>
+                          ))}
+                        </select>
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={weight}
+                          onChange={(e) => {
+                            const val = parseFloat(e.target.value) || 0;
+                            setMoodWeights((prev) => ({
+                              ...prev,
+                              [mood]: { ...prev[mood], [klass]: val },
+                            }));
+                          }}
+                          className="w-20 rounded-[10px] px-3 py-2 text-[12px] outline-none"
+                          style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text }}
+                        />
+                        <button
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                          style={{ boxShadow: "var(--card-shadow-sm)", background: S.bg }}
+                          onClick={() => {
+                            setMoodWeights((prev) => {
+                              const updated = { ...prev[mood] };
+                              delete updated[klass];
+                              return { ...prev, [mood]: updated };
+                            });
+                          }}
+                        >
+                          <X size={12} style={{ color: S.textMuted }} />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      className="mt-1 flex items-center gap-1 rounded-[10px] px-3 py-1.5 text-[11px] font-semibold"
+                      style={{ boxShadow: "var(--card-shadow-sm)", background: S.bg, color: S.accentDark }}
+                      onClick={() => {
+                        const existing = Object.keys(moodWeights[mood] || {});
+                        const allKlass = ["identity","relationship","bond","conflict","fact","preference","health","task","ephemeral","other"];
+                        const next = allKlass.find((k) => !existing.includes(k)) || "";
+                        setMoodWeights((prev) => ({
+                          ...prev,
+                          [mood]: { ...prev[mood], [next]: 1.0 },
+                        }));
+                      }}
+                    >
+                      <Plus size={12} /> 添加 klass
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Save via top-right button (handleSave) */}
+          </>
+        )}
+
+        {tab === "memo" && (
+          !memoLoaded ? (
+            <div className="flex h-40 items-center justify-center">
+              <div className="h-8 w-8 animate-spin rounded-full border-2" style={{ borderColor: S.accent, borderTopColor: "transparent" }} />
+            </div>
+          ) : (
+            <>
+              <div className="mb-4 rounded-[20px] p-4" style={{ background: S.bg, boxShadow: "var(--card-shadow)" }}>
+                <label className="mb-2 block text-[11px] font-semibold uppercase tracking-wide" style={{ color: S.textMuted }}>
+                  备忘录（助手A的 memo · 常驻上下文）
+                </label>
+                <p className="mb-3 text-[11px]" style={{ color: S.textMuted }}>
+                  全局备忘录，所有助手共用。长期稳定信息（规则、禁忌、设定）放这里。改动会重建缓存，不要频繁改。
+                </p>
+                <textarea
+                  value={memo}
+                  onChange={(e) => setMemo(e.target.value)}
+                  className="w-full rounded-[14px] px-4 py-3 text-[13px] outline-none resize-y"
+                  style={{ boxShadow: "var(--inset-shadow)", background: S.bg, color: S.text, minHeight: 400, fontFamily: "var(--font-mono, monospace)" }}
+                  placeholder="备忘录内容..."
+                />
+              </div>
+              <button
+                className="w-full rounded-[14px] py-3 text-[13px] font-semibold"
+                style={{ background: S.accent, color: "white", boxShadow: "var(--card-shadow-sm)", opacity: memoSaving ? 0.6 : 1 }}
+                onClick={saveMemo}
+                disabled={memoSaving}
+              >
+                {memoSaving ? "保存中..." : "保存备忘录"}
+              </button>
+            </>
+          )
         )}
         </>
         )}
@@ -1283,6 +1764,13 @@ export default function AssistantEdit() {
             }
           }}
           onClose={() => setHistoryBlockType(null)}
+        />
+      )}
+      {candidatesBlockType && (
+        <CandidatesOverlay
+          blockType={candidatesBlockType}
+          assistantId={id}
+          onClose={() => setCandidatesBlockType(null)}
         />
       )}
 

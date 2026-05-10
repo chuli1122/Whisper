@@ -29,6 +29,7 @@ class Message(Base):
     request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     telegram_message_id: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
     qq_message_id: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
+    wechat_message_id: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     image_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
@@ -144,6 +145,7 @@ class WorldBook(Base):
     keywords: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True, default=list)
     message_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     folder: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    xml_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
@@ -164,7 +166,66 @@ class Memory(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     is_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    disclosure: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class MemoryVersion(Base):
+    __tablename__ = "memory_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    memory_id: Mapped[int] = mapped_column(Integer, ForeignKey("memories.id"), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    klass: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tags: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    disclosure: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class SummaryVersion(Base):
+    __tablename__ = "summary_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    summary_id: Mapped[int] = mapped_column(Integer, ForeignKey("session_summaries.id"), nullable=False, index=True)
+    summary_content: Mapped[str] = mapped_column(Text, nullable=False)
+    mood_tag: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    changed_by: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class ReflectionLog(Base):
+    __tablename__ = "reflection_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    memory_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    changes: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    model_used: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class PendingReflectionChange(Base):
+    __tablename__ = "pending_reflection_changes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    reflection_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)  # update / delete / merge
+    memory_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    merge_into_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Proposed new values
+    proposed_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposed_klass: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    proposed_disclosure: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposed_tags: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Snapshot of old values
+    old_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    old_klass: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    old_disclosure: Mapped[str | None] = mapped_column(Text, nullable=True)
+    merge_target_old_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Status: pending / confirmed / rejected
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
 
@@ -202,6 +263,7 @@ class Diary(Base):
     is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     unlock_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
@@ -212,7 +274,7 @@ class ApiProvider(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     base_url: Mapped[str] = mapped_column(String(255), nullable=False)
-    api_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
     auth_type: Mapped[str] = mapped_column(String(50), nullable=False, default="api_key")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
@@ -227,6 +289,7 @@ class ModelPreset(Base):
     top_p: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=2048)
     thinking_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    thinking_keyword: Mapped[str | None] = mapped_column(String(20), nullable=True, default=None)
     api_provider_id: Mapped[int] = mapped_column(Integer, ForeignKey("api_providers.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
 
@@ -312,3 +375,61 @@ class CotRecord(Base):
     tool_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     assistant_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class IosCommand(Base):
+    __tablename__ = "ios_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class IosReport(Base):
+    __tablename__ = "ios_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing, index=True)
+
+
+class YoruMemory(Base):
+    __tablename__ = "yoru_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class YoruChat(Base):
+    __tablename__ = "yoru_chat"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing, index=True)
+
+
+class RinMemory(Base):
+    __tablename__ = "rin_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing)
+
+
+class RinChat(Base):
+    __tablename__ = "rin_chat"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_beijing, index=True)

@@ -1,0 +1,21 @@
+{
+  "name": "WHISPER",
+  "short_name": "WHISPER",
+  "start_url": "/miniapp/",
+  "scope": "/miniapp/",
+  "display": "standalone",
+  "background_color": "#e8eaed",
+  "theme_color": "#e8eaed",
+  "icons": [
+    {
+      "src": "/miniapp/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/miniapp/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

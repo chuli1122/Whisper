@@ -72,14 +72,14 @@ class CoreBlocksService:
             return ""
 
         sections: list[str] = []
-        human_block = self.get_block("human", assistant_id)
-        if human_block and human_block.content and human_block.content.strip():
-            sections.append(f"[About the user - what I know about her]\n{human_block.content.strip()}")
-
         persona_block = self.get_block("persona", assistant_id)
         if persona_block and persona_block.content and persona_block.content.strip():
             sections.append(
-                f"[About myself - who I am]\n{persona_block.content.strip()}"
+                f'<self_identity name="About myself">\n{persona_block.content.strip()}\n</self_identity>'
             )
+
+        human_block = self.get_block("human", assistant_id)
+        if human_block and human_block.content and human_block.content.strip():
+            sections.append(f'<user_knowledge name="About the user">\n{human_block.content.strip()}\n</user_knowledge>')
 
         return "\n\n".join(sections)

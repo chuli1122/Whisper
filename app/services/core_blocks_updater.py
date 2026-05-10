@@ -22,6 +22,9 @@ from app.utils import TZ_EAST8
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_AUTO_REWRITE_THRESHOLD = 10
+
+
 class CoreBlocksUpdater:
     def __init__(self, session_factory: sessionmaker, adopt_threshold: int = 2) -> None:
         self.session_factory = session_factory
@@ -59,6 +62,13 @@ class CoreBlocksUpdater:
                     stats[outcome] += 1
 
             db.commit()
+
+            # Auto-rewrite if adopted count meets threshold
+            try:
+                self._maybe_auto_rewrite(db, assistant_id)
+            except Exception:
+                logger.exception("Auto-rewrite check failed")
+
             return stats
         except Exception:
             db.rollback()
@@ -70,6 +80,46 @@ class CoreBlocksUpdater:
             return stats
         finally:
             db.close()
+
+    def _maybe_auto_rewrite(self, db: Session, assistant_id: int) -> None:
+        """Check if adopted candidates have reached threshold and auto-trigger rewrite."""
+        from app.models.models import Settings
+
+        # Check if core blocks auto-rewrite is enabled
+        enabled_row = db.query(Settings).filter(Settings.key == "core_blocks_enabled").first()
+        if enabled_row and enabled_row.value and enabled_row.value.lower() not in ("true", "1", "yes"):
+            return
+
+        # Read threshold from Settings
+        threshold = _DEFAULT_AUTO_REWRITE_THRESHOLD
+        row = db.query(Settings).filter(Settings.key == "core_blocks_auto_rewrite_threshold").first()
+        if row:
+            try:
+                threshold = int(row.value)
+            except (ValueError, TypeError):
+                pass
+
+        adopted_count = (
+            db.query(CoreBlockCandidate)
+            .filter(
+                CoreBlockCandidate.status == "adopted",
+                CoreBlockCandidate.assistant_id == assistant_id,
+            )
+            .count()
+        )
+        if adopted_count >= threshold:
+            logger.info(
+                "[core_blocks] Auto-rewrite triggered: %d adopted (threshold=%d)",
+                adopted_count,
+                threshold,
+            )
+            # rewrite_adopted_candidates creates its own db session
+            import threading
+            threading.Thread(
+                target=self.rewrite_adopted_candidates,
+                kwargs={"assistant_id": assistant_id},
+                daemon=True,
+            ).start()
 
     def rewrite_adopted_candidates(
         self, assistant_id: int | None = None
@@ -204,9 +254,9 @@ class CoreBlocksUpdater:
             "从摘要文本中提取稳定的 core-block 更新信号。"
             "只返回 JSON，格式：{\"candidates\":[{\"block_type\":\"human|persona\",\"content\":\"...\"}]}。"
             "只提取跨会话持久有效的更新，跳过临时闲聊。"
-            "human block：AI 视角下对初礼的理解——行为模式、情绪习惯、沟通风格、互动特点。"
+            "human block：AI 视角下对用户的理解——行为模式、情绪习惯、沟通风格、互动特点。"
             "不要包含固定档案信息（生日、性别、星座、饮食禁忌等），那些属于 basic info。"
-            "persona block：AI 在相处中形成的自我认知——自己的性格特点、行为倾向、情绪模式，以及与初礼之间形成的默契和不言而喻的共识。"
+            "persona block：AI 在相处中形成的自我认知——自己的性格特点、行为倾向、情绪模式，以及与用户之间形成的默契和不言而喻的共识。"
         )
         user_prompt = (
             f"Assistant name: {assistant.name}\n"
@@ -335,7 +385,7 @@ class CoreBlocksUpdater:
         system_prompt = (
             "将 core memory block 重写为简洁一致的文本。"
             "只返回 JSON：{\"content\": \"...\"}，不要 markdown。"
-            "human block 用 AI 的视角写对初礼的理解，persona block 用 AI 的视角写对自己的认知。"
+            "human block 用 AI 的视角写对用户的理解，persona block 用 AI 的视角写对自己的认知。"
             "控制在 500 字以内。"
         )
         user_prompt = (

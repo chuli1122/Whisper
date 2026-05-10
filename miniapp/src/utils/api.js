@@ -57,16 +57,23 @@ export async function apiFetch(path, options = {}) {
   return res.json();
 }
 
-export async function loginWithPassword(password) {
+export async function loginWithPassword(password, totpCode) {
+  const body = { password };
+  if (totpCode) body.totp_code = totpCode;
   const res = await fetch(`${API_BASE}/api/auth/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   if (data.success && data.token) {
     localStorage.setItem("whisper_token", data.token);
-    return true;
+    return data;
   }
   throw new Error(data.detail || "密码错误");
+}
+
+export async function checkIpStatus() {
+  const res = await fetch(`${API_BASE}/api/auth/check-ip`);
+  return res.json();
 }

@@ -64,16 +64,17 @@ def _is_allowed(chat_id: int) -> bool:
 
 _PLATFORM_SWITCH_PROMPTS: dict[str, str] = {
     "telegram": (
-        "[环境切换] 当前平台：Telegram（长消息模式）。\n"
-        "注意：从这条消息开始按以下要求输出，不要模仿上文的风格。\n"
-        "要求：完整段落输出，不拆条，不使用[NEXT]，每次回复至少3段，"
-        "说话用双引号包裹（如\"我想你了。\"），动作描写和语言自然穿插交织在同一段内，段落要有体量。"
-        "回复正文中一律使用第二人称\"你\"称呼对方，不许用\"她\"。"
+        "[环境切换] 当前平台：Telegram（长消息模式）。"
+        "注意：从本条消息起严格按以下规则输出，不再沿用之前的回复风格。"
+        "要求：采用第一视角叙事，仅描述自身动作、神态与状态；说话内容用双引号包裹，与动作、神态自然交织为完整段落。"
+        "用空行分段，不拆条，不使用[NEXT]，回复需连贯饱满。内心情绪通过动作与语气含蓄表达，不使用直白心理旁白。"
+        "回复中统一使用第二人称\"你\"称呼对方，禁止使用\"她\"。"
     ),
     "qq": (
-        "[环境切换] 当前平台：QQ（短消息模式）。\n"
-        "注意：从这条消息开始按以下要求输出，不要模仿上文的风格。\n"
-        "要求：像真人发微信一样自然回复，用[NEXT]拆条，不使用空行分段，不使用动作描写。"
+        "[环境切换] 当前平台：QQ（短消息模式）。"
+        "注意：从本条消息起严格按以下规则输出，不再沿用之前的回复风格。"
+        "要求：采用日常短消息表达习惯，语气轻松自然；无动作描写，语句以逗号或空格分隔，"
+        "可使用[NEXT]拆条，不使用空行分段。整体追求流畅真实的聊天质感，避免生硬书面化。"
     ),
 }
 
@@ -112,8 +113,56 @@ def _record_last_active_telegram() -> None:
             )
             old_source = last_msg.meta_info.get("source") if last_msg else None
 
+            # Override old_source if model recently switched via switch_channel
+            recent_switch_tool = (
+                db.query(MessageModel)
+                .filter(
+                    MessageModel.session_id == latest_session.id,
+                    MessageModel.role == "tool",
+                    MessageModel.meta_info["tool_name"].astext == "switch_channel",
+                    MessageModel.id > (last_msg.id if last_msg else 0),
+                )
+                .order_by(MessageModel.id.desc())
+                .first()
+            )
+            if recent_switch_tool:
+                content = recent_switch_tool.content or ""
+                if "Telegram" in content:
+                    old_source = "telegram"
+                elif "QQ" in content:
+                    old_source = "qq"
+
         # Platform changed (or no source history) → insert mode switch system message
-        need_switch = old_source is None or old_source != "telegram"
+        need_switch = old_source is not None and old_source != "telegram"
+        # Avoid duplicate: check if a mode_switch message was already inserted recently
+        if need_switch and latest_session:
+            recent_switch = (
+                db.query(MessageModel)
+                .filter(
+                    MessageModel.session_id == latest_session.id,
+                    MessageModel.role == "system",
+                    MessageModel.meta_info["mode_switch"].astext == "true",
+                    MessageModel.id > (last_msg.id if last_msg else 0),
+                )
+                .first()
+            )
+            if recent_switch:
+                need_switch = False
+        # Skip if model already switched to this platform via switch_channel tool
+        if need_switch and latest_session and last_msg:
+            recent_tool_switch = (
+                db.query(MessageModel)
+                .filter(
+                    MessageModel.session_id == latest_session.id,
+                    MessageModel.role == "tool",
+                    MessageModel.meta_info["tool_name"].astext == "switch_channel",
+                    MessageModel.id > (last_msg.id if last_msg else 0),
+                )
+                .order_by(MessageModel.id.desc())
+                .first()
+            )
+            if recent_tool_switch and "Telegram" in (recent_tool_switch.content or ""):
+                need_switch = False
         if need_switch:
             prompt = _PLATFORM_SWITCH_PROMPTS.get("telegram", "")
             if prompt and latest_session:
@@ -172,7 +221,7 @@ async def _send_one_part(bot: Bot, chat_id: int, text: str, *, explicit_block: b
             continue
 
         if sent_something:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(_typing_delay(seg_text))
 
         if idx == 0:
             # Text before the first voice tag → plain text
@@ -181,9 +230,8 @@ async def _send_one_part(bot: Bot, chat_id: int, text: str, *, explicit_block: b
             sent_something = True
         else:
             # Text after a voice tag
-            emotion = segments[idx - 1].lower()
-            if emotion not in VALID_EMOTIONS:
-                emotion = None
+            from app.services.tts_service import resolve_emotion
+            emotion = resolve_emotion(segments[idx - 1])
 
             if explicit_block:
                 # Model used [NEXT] — voice the entire segment
@@ -196,29 +244,41 @@ async def _send_one_part(bot: Bot, chat_id: int, text: str, *, explicit_block: b
                 rest_text = lines[1].strip() if len(lines) > 1 else ""
 
             if voice_line and emotion and len(voice_line) <= 300:
+                voice_sent = False
                 try:
                     audio_bytes = await asyncio.to_thread(synthesize, voice_line, emotion)
                     if audio_bytes:
                         from aiogram.types import BufferedInputFile
                         voice_file = BufferedInputFile(audio_bytes, filename="voice.mp3")
-                        await bot.send_voice(chat_id=chat_id, voice=voice_file)
-                        logger.info("[voice] Sent voice (emotion=%s, %d chars)", emotion, len(voice_line))
+                        sent = await bot.send_voice(chat_id=chat_id, voice=voice_file, caption=voice_line)
+                        last_id = sent.message_id
+                        sent_something = True
+                        voice_sent = True
+                        logger.info("[voice] Sent voice with caption (emotion=%s, %d chars)", emotion, len(voice_line))
                 except Exception as e:
                     logger.warning("[voice] Voice send failed: %s", e)
 
-            if voice_line:
+            if voice_line and not voice_sent:
                 sent = await bot.send_message(chat_id=chat_id, text=voice_line)
                 last_id = sent.message_id
                 sent_something = True
 
             if rest_text:
                 if sent_something:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(_typing_delay(rest_text))
                 sent = await bot.send_message(chat_id=chat_id, text=rest_text)
                 last_id = sent.message_id
                 sent_something = True
 
     return last_id
+
+
+def _typing_delay(text: str) -> float:
+    """Simulate natural typing delay based on message length."""
+    import random
+    base = random.uniform(2.0, 3.0)
+    length_bonus = min(len(text) * 0.05, 2.5)
+    return base + length_bonus
 
 
 async def _send_reply_with_voice(bot: Bot, chat_id: int, text: str) -> list[int]:
@@ -227,17 +287,28 @@ async def _send_reply_with_voice(bot: Bot, chat_id: int, text: str) -> list[int]
     if not text.strip():
         return tg_ids
 
+    # Safety net: strip any leaked memory reference IDs, metadata, or THINK blocks
+    import re as _re
+    text = _re.sub(r'(?:\[THINK\]|<scratchpad>).*?(?:\[/THINK\]|</THINK>|</thinking>|</scratchpad>)', '', text, flags=_re.DOTALL)
+    for _orphan in ('<scratchpad>', '</scratchpad>', '[THINK]', '[/THINK]', '</THINK>', '</thinking>'):
+        text = text.replace(_orphan, '')
+    text = _re.sub(r'\[#\s*\d+\s*\]\s*', '', text)
+    text = _re.sub(r'\[\[used:[\d,\s]+\]\]', '', text)
+    text = _re.sub(r'\(来源:\s*\w+\)\s*$', '', text, flags=_re.MULTILINE)
     parts = [p.strip() for p in text.split("[NEXT]") if p.strip()]
     has_next = len(parts) > 1  # model explicitly used [NEXT]
 
     for i, part in enumerate(parts):
         if i > 0:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(_typing_delay(part))
         tg_id = await _send_one_part(bot, chat_id, part, explicit_block=has_next)
         if tg_id:
             tg_ids.append(tg_id)
 
     return tg_ids
+
+
+_session_locks: dict[int, asyncio.Lock] = {}
 
 
 async def _process_request(
@@ -249,42 +320,153 @@ async def _process_request(
 
     telegram_message_id: list[int] | None = None,
 ) -> None:
-    stop_event = asyncio.Event()
-    typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_event))
+    session_id, assistant_name = await get_session_info(assistant_id)
 
-    try:
-        session_id, assistant_name = await get_session_info(assistant_id)
-        result_messages = await call_chat_completion(
-            session_id, assistant_name, combined_text,
-            short_mode=False,
-            telegram_message_id=telegram_message_id,
-            assistant_id=assistant_id,
-        )
+    # Per-session lock: queue new messages while previous request is still running
+    if session_id not in _session_locks:
+        _session_locks[session_id] = asyncio.Lock()
+    lock = _session_locks[session_id]
 
-        stop_event.set()
-        typing_task.cancel()
+    if lock.locked():
+        logger.info("[telegram] Session %d busy, queuing message", session_id)
 
-        sent_count = 0
-        for msg in result_messages:
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            if sent_count > 0:
-                await asyncio.sleep(1.0)
-            tg_ids = await _send_reply_with_voice(bot, chat_id, content, )
-            # Write back telegram message ID to the assistant message in DB
-            if tg_ids and msg.get("db_id"):
-                await update_telegram_message_id(msg["db_id"], tg_ids[-1])
-            sent_count += 1
-
-    except Exception as exc:
-        stop_event.set()
-        typing_task.cancel()
-        logger.error("Error processing request for chat %s (bot=%s): %s", chat_id, bot_key, exc, exc_info=True)
+    async with lock:
+        # If cafe @mention generation is in progress, wait for it so its
+        # tool-call messages land in DB first and end up in the private-chat context.
         try:
-            await bot.send_message(chat_id=chat_id, text="❌ 出错了，请稍后再试")
+            from app.services.cafe_service import cafe_service as _cafe_service
+            _wait_start = asyncio.get_event_loop().time()
+            while getattr(_cafe_service, "_generating_source", None):
+                if asyncio.get_event_loop().time() - _wait_start > 120:
+                    logger.warning("[tg] Waited 120s for cafe to release, giving up")
+                    break
+                await asyncio.sleep(0.2)
         except Exception:
-            pass
+            logger.warning("[tg] cafe service lookup failed (continuing)", exc_info=True)
+
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_event))
+
+        try:
+            # Collect thinking chunks so we can attach an expandable CoT
+            # block to clean single long-mode replies.
+            thinking_buf = [""]
+            def _on_thinking(chunk: str) -> None:
+                thinking_buf[0] += chunk
+
+            result_messages = await call_chat_completion(
+                session_id, assistant_name, combined_text,
+                short_mode=False,
+                telegram_message_id=telegram_message_id,
+                assistant_id=assistant_id,
+                chat_id=chat_id,
+                bot=bot,
+                on_thinking_chunk=_on_thinking,
+            )
+
+            stop_event.set()
+            typing_task.cancel()
+
+            sent_count = 0
+            for msg in result_messages:
+                content = (msg.get("content") or "").strip()
+                if not content or msg.get("no_message"):
+                    continue
+                # Route to QQ if model switched channel
+                if msg.get("_switched_channel") == "qq":
+                    try:
+                        from app.qq.service import send_reply_with_voice as qq_send
+                        from app.telegram.service import get_setting
+                        qq_uid = await get_setting("last_active_qq_user_id")
+                        if qq_uid:
+                            await qq_send(int(qq_uid), content)
+                            logger.info("[switch_channel] Routed reply to QQ (uid=%s)", qq_uid)
+                            continue
+                    except Exception as e:
+                        logger.error("[switch_channel] Failed to route to QQ: %s", e)
+                elif msg.get("_switched_channel") == "wechat":
+                    try:
+                        from app.wechat.service import send_reply as wx_send
+                        from app.telegram.service import get_setting
+                        wx_uid = await get_setting("last_active_wechat_user_id")
+                        if wx_uid:
+                            await wx_send(wx_uid, content)
+                            logger.info("[switch_channel] Routed reply to WeChat (uid=%s)", wx_uid)
+                            continue
+                    except Exception as e:
+                        logger.error("[switch_channel] Failed to route to WeChat: %s", e)
+                if sent_count > 0:
+                    await asyncio.sleep(_typing_delay(content))
+
+                # Attach expandable CoT block only for single clean long-mode replies
+                # (no [NEXT] splits / no [voice:] tags / no channel switch)
+                use_cot_block = (
+                    len(result_messages) == 1
+                    and thinking_buf[0].strip()
+                    and "[NEXT]" not in content
+                    and "[voice:" not in content
+                )
+                cot_sent_id: int | None = None
+                if use_cot_block:
+                    import html as _html, re as _re
+                    cleaned = _re.sub(r'(?:\[THINK\]|<scratchpad>).*?(?:\[/THINK\]|</THINK>|</thinking>|</scratchpad>)', '', content, flags=_re.DOTALL)
+                    for _orphan in ('<scratchpad>', '</scratchpad>', '[THINK]', '[/THINK]', '</THINK>', '</thinking>'):
+                        cleaned = cleaned.replace(_orphan, '')
+                    cleaned = _re.sub(r'\[#\s*\d+\s*\]\s*', '', cleaned)
+                    cleaned = _re.sub(r'\[\[used:[\d,\s]+\]\]', '', cleaned)
+                    cleaned = _re.sub(r'\(来源:\s*\w+\)\s*$', '', cleaned, flags=_re.MULTILINE)
+                    cleaned = cleaned.strip()
+                    if cleaned:
+                        safe_thinking = _html.escape(thinking_buf[0].strip())
+                        safe_content = _html.escape(cleaned)
+                        combined = (
+                            f"<blockquote expandable><b>助手A正在想…💭</b>\n\n{safe_thinking}</blockquote>\n\n"
+                            f"{safe_content}"
+                        )
+                        if len(combined) <= 4000:
+                            # CoT + 正文装得下一条
+                            try:
+                                sent = await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=combined,
+                                    parse_mode="HTML",
+                                )
+                                cot_sent_id = sent.message_id
+                            except Exception as e:
+                                logger.warning("[tg] CoT+body send failed, falling back to plain: %s", e)
+                        else:
+                            # 超 4096 硬限,把 CoT 独立一条先发,正文走下面 _send_reply_with_voice
+                            cot_only = f"<blockquote expandable><b>助手A正在想…💭</b>\n\n{safe_thinking}</blockquote>"
+                            if len(cot_only) <= 4000:
+                                try:
+                                    await bot.send_message(
+                                        chat_id=chat_id,
+                                        text=cot_only,
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as e:
+                                    logger.warning("[tg] CoT-only send failed: %s", e)
+                            else:
+                                logger.warning("[tg] CoT itself > 4000 chars, dropped")
+                            # cot_sent_id stays None → body goes through _send_reply_with_voice below
+
+                if cot_sent_id is not None:
+                    if msg.get("db_id"):
+                        await update_telegram_message_id(msg["db_id"], cot_sent_id)
+                else:
+                    tg_ids = await _send_reply_with_voice(bot, chat_id, content)
+                    if tg_ids and msg.get("db_id"):
+                        await update_telegram_message_id(msg["db_id"], tg_ids[-1])
+                sent_count += 1
+
+        except Exception as exc:
+            stop_event.set()
+            typing_task.cancel()
+            logger.error("Error processing request for chat %s (bot=%s): %s", chat_id, bot_key, exc, exc_info=True)
+            try:
+                await bot.send_message(chat_id=chat_id, text="❌ 出错了，请稍后再试")
+            except Exception:
+                pass
 
 
 async def _process_photo_request(
@@ -308,17 +490,41 @@ async def _process_photo_request(
             short_mode=False,
             telegram_message_id=telegram_message_id,
             assistant_id=assistant_id,
+            chat_id=chat_id,
+            bot=bot,
         )
         stop_event.set()
         typing_task.cancel()
         sent_count = 0
         for msg in result_messages:
             reply_content = (msg.get("content") or "").strip()
-            if not reply_content:
+            if not reply_content or msg.get("no_message"):
                 continue
+            if msg.get("_switched_channel") == "qq":
+                try:
+                    from app.qq.service import send_reply_with_voice as qq_send
+                    from app.telegram.service import get_setting
+                    qq_uid = await get_setting("last_active_qq_user_id")
+                    if qq_uid:
+                        await qq_send(int(qq_uid), reply_content)
+                        logger.info("[switch_channel] Routed reply to QQ (uid=%s)", qq_uid)
+                        continue
+                except Exception as e:
+                    logger.error("[switch_channel] Failed to route to QQ: %s", e)
+            elif msg.get("_switched_channel") == "wechat":
+                try:
+                    from app.wechat.service import send_reply as wx_send
+                    from app.telegram.service import get_setting
+                    wx_uid = await get_setting("last_active_wechat_user_id")
+                    if wx_uid:
+                        await wx_send(wx_uid, reply_content)
+                        logger.info("[switch_channel] Routed reply to WeChat (uid=%s)", wx_uid)
+                        continue
+                except Exception as e:
+                    logger.error("[switch_channel] Failed to route to WeChat: %s", e)
             if sent_count > 0:
-                await asyncio.sleep(1.0)
-            tg_ids = await _send_reply_with_voice(bot, chat_id, reply_content, )
+                await asyncio.sleep(_typing_delay(reply_content))
+            tg_ids = await _send_reply_with_voice(bot, chat_id, reply_content)
             if tg_ids and msg.get("db_id"):
                 await update_telegram_message_id(msg["db_id"], tg_ids[-1])
             sent_count += 1
@@ -353,17 +559,41 @@ async def _process_file_request(
             short_mode=False,
             telegram_message_id=telegram_message_id,
             assistant_id=assistant_id,
+            chat_id=chat_id,
+            bot=bot,
         )
         stop_event.set()
         typing_task.cancel()
         sent_count = 0
         for msg in result_messages:
             reply_content = (msg.get("content") or "").strip()
-            if not reply_content:
+            if not reply_content or msg.get("no_message"):
                 continue
+            if msg.get("_switched_channel") == "qq":
+                try:
+                    from app.qq.service import send_reply_with_voice as qq_send
+                    from app.telegram.service import get_setting
+                    qq_uid = await get_setting("last_active_qq_user_id")
+                    if qq_uid:
+                        await qq_send(int(qq_uid), reply_content)
+                        logger.info("[switch_channel] Routed reply to QQ (uid=%s)", qq_uid)
+                        continue
+                except Exception as e:
+                    logger.error("[switch_channel] Failed to route to QQ: %s", e)
+            elif msg.get("_switched_channel") == "wechat":
+                try:
+                    from app.wechat.service import send_reply as wx_send
+                    from app.telegram.service import get_setting
+                    wx_uid = await get_setting("last_active_wechat_user_id")
+                    if wx_uid:
+                        await wx_send(wx_uid, reply_content)
+                        logger.info("[switch_channel] Routed reply to WeChat (uid=%s)", wx_uid)
+                        continue
+                except Exception as e:
+                    logger.error("[switch_channel] Failed to route to WeChat: %s", e)
             if sent_count > 0:
-                await asyncio.sleep(1.0)
-            tg_ids = await _send_reply_with_voice(bot, chat_id, reply_content, )
+                await asyncio.sleep(_typing_delay(reply_content))
+            tg_ids = await _send_reply_with_voice(bot, chat_id, reply_content)
             if tg_ids and msg.get("db_id"):
                 await update_telegram_message_id(msg["db_id"], tg_ids[-1])
             sent_count += 1
@@ -450,7 +680,7 @@ async def handle_message(message: Message, bot: Bot, bot_key: str, assistant_id:
             photo = message.photo[-1]  # largest size
             file_info = await bot.get_file(photo.file_id)
             file_bytes = await bot.download_file(file_info.file_path)
-            image_data = encode_photo_base64(file_bytes, "image/jpeg")
+            image_data = await asyncio.to_thread(encode_photo_base64, file_bytes, "image/jpeg")
         except Exception as exc:
             logger.error("Failed to download photo: %s", exc)
             return

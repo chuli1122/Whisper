@@ -11,5 +11,16 @@ QQ_ALLOWED_USER_IDS: set[int] = {
     int(x) for x in _raw.split(",") if x.strip() and x.strip().isdigit()
 }
 
-# QQ is always 阿澄
-QQ_ASSISTANT_ID: int = 2
+# Assistant used for QQ messages in the demo.
+QQ_ASSISTANT_ID: int = int(os.getenv("QQ_ASSISTANT_ID", "1"))
+
+# Group-mention trigger: fires when any sender in QQ_GROUP_ALLOWED_SENDERS @-mentions QQ_BOT_UIN in QQ_GROUP_ID.
+QQ_GROUP_ID: int = int(os.getenv("QQ_GROUP_ID", "0"))
+QQ_BOT_UIN: int = int(os.getenv("QQ_BOT_UIN", "0"))
+QQ_OWNER_UID: int = int(os.getenv("QQ_OWNER_UID", "0"))
+
+# Whitelisted QQ ids that can trigger a reply by @-ing the bot in the group.
+QQ_GROUP_ALLOWED_SENDERS: set[int] = {
+    int(x) for x in os.getenv("QQ_GROUP_ALLOWED_SENDERS", "0").split(",")
+    if x.strip().isdigit()
+}

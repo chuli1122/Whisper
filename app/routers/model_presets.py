@@ -22,6 +22,7 @@ class PresetItem(BaseModel):
     top_p: float | None
     max_tokens: int
     thinking_budget: int
+    thinking_keyword: str | None
     api_provider_id: int
     created_at: str | None
 
@@ -37,6 +38,7 @@ class PresetCreateRequest(BaseModel):
     top_p: float | None = None
     max_tokens: int = 2048
     thinking_budget: int = 0
+    thinking_keyword: str | None = None
     api_provider_id: int
 
 
@@ -47,6 +49,7 @@ class PresetUpdateRequest(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = None
     thinking_budget: int | None = None
+    thinking_keyword: str | None = None
     api_provider_id: int | None = None
 
 
@@ -59,6 +62,7 @@ def _to_item(row: ModelPreset) -> PresetItem:
         top_p=row.top_p,
         max_tokens=row.max_tokens,
         thinking_budget=row.thinking_budget or 0,
+        thinking_keyword=row.thinking_keyword,
         api_provider_id=row.api_provider_id,
         created_at=format_datetime(row.created_at),
     )
@@ -88,6 +92,7 @@ def create_preset(
         top_p=payload.top_p,
         max_tokens=payload.max_tokens,
         thinking_budget=payload.thinking_budget,
+        thinking_keyword=payload.thinking_keyword,
         api_provider_id=payload.api_provider_id,
     )
     db.add(preset)
@@ -123,6 +128,22 @@ def delete_preset(
     preset = db.query(ModelPreset).filter(ModelPreset.id == preset_id).first()
     if not preset:
         raise HTTPException(status_code=404, detail="Preset not found")
+
+    from app.models.models import Assistant
+    # Null out any Assistant FK pointing at this preset so delete doesn't
+    # trip the FK constraint. Assistant UI then shows "empty" for that slot.
+    for assistant in db.query(Assistant).filter(
+        (Assistant.model_preset_id == preset_id)
+        | (Assistant.summary_model_preset_id == preset_id)
+        | (Assistant.summary_fallback_preset_id == preset_id)
+    ):
+        if assistant.model_preset_id == preset_id:
+            assistant.model_preset_id = None
+        if assistant.summary_model_preset_id == preset_id:
+            assistant.summary_model_preset_id = None
+        if assistant.summary_fallback_preset_id == preset_id:
+            assistant.summary_fallback_preset_id = None
+    db.flush()
 
     db.delete(preset)
     db.commit()

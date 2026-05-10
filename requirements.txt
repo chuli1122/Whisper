@@ -13,3 +13,4 @@ aiogram
 python-multipart
 pdfplumber
 tavily-python
+Pillow

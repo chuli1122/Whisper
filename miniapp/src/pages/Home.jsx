@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { BookOpen, Brain, Bot, Settings, BookMarked, Theater, Heart, ChevronRight } from "lucide-react";
 import { apiFetch } from "../utils/api";
@@ -14,9 +14,30 @@ const S = {
 
 function GridCard({ icon, label, desc, disabled, onClick, badge }) {
   const [pressed, setPressed] = useState(false);
+  const touchRef = useRef(null);
 
-  const start = () => !disabled && setPressed(true);
-  const end = () => { setPressed(false); if (!disabled) onClick?.(); };
+  const touchStart = (e) => {
+    if (disabled) return;
+    const t = e.touches[0];
+    touchRef.current = { x: t.clientX, y: t.clientY, moved: false };
+    setPressed(true);
+  };
+  const touchMove = (e) => {
+    if (!touchRef.current) return;
+    const t = e.touches[0];
+    const dx = t.clientX - touchRef.current.x;
+    const dy = t.clientY - touchRef.current.y;
+    if (dx * dx + dy * dy > 100) { // 10px threshold
+      touchRef.current.moved = true;
+      setPressed(false);
+    }
+  };
+  const touchEnd = () => {
+    const wasMoved = touchRef.current?.moved;
+    touchRef.current = null;
+    setPressed(false);
+    if (!disabled && !wasMoved) onClick?.();
+  };
 
   return (
     <button
@@ -34,10 +55,11 @@ function GridCard({ icon, label, desc, disabled, onClick, badge }) {
         WebkitTapHighlightColor: "transparent",
       }}
       disabled={disabled}
-      onTouchStart={start}
-      onTouchEnd={end}
-      onMouseDown={start}
-      onMouseUp={end}
+      onTouchStart={touchStart}
+      onTouchMove={touchMove}
+      onTouchEnd={touchEnd}
+      onMouseDown={() => !disabled && setPressed(true)}
+      onMouseUp={() => { setPressed(false); if (!disabled) onClick?.(); }}
       onMouseLeave={() => setPressed(false)}
     >
       <div className="relative">
@@ -87,7 +109,7 @@ export default function Home() {
     getAvatar("user-avatar").then((b64) => { if (b64) setAvatarUrl(b64); }).catch(function() {});
     apiFetch("/api/diary/unread-count").then((d) => { if (d.count > 0) setDiaryUnread(true); }).catch(() => {});
   }, []);
-  const nickname = profile?.nickname || "阿怀";
+  const nickname = profile?.nickname || "助手B";
   const signature = profile?.background_url || "今晚的月亮很圆";
 
   return (

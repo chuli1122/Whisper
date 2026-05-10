@@ -17,7 +17,17 @@ from app.models.models import Settings
 logger = logging.getLogger(__name__)
 
 VALID_EMOTIONS = {"happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"}
+# Common aliases → canonical emotion
+EMOTION_ALIASES = {"calm": "neutral", "clam": "neutral", "gentle": "neutral", "soft": "sad"}
 EMOTION_TAG_RE = re.compile(r"\[\[voice:(\w+)\]\]")
+
+
+def resolve_emotion(raw: str) -> str | None:
+    """Resolve an emotion string to a valid emotion, handling aliases."""
+    e = raw.lower()
+    if e in VALID_EMOTIONS:
+        return e
+    return EMOTION_ALIASES.get(e)
 
 
 def parse_emotion_tag(content: str) -> tuple[str, str | None]:
@@ -26,9 +36,9 @@ def parse_emotion_tag(content: str) -> tuple[str, str | None]:
     match = EMOTION_TAG_RE.search(content)
     if not match:
         return content, None
-    emotion = match.group(1).lower()
+    emotion = resolve_emotion(match.group(1))
     clean = EMOTION_TAG_RE.sub("", content).strip()
-    return clean, emotion if emotion in VALID_EMOTIONS else None
+    return clean, emotion
 
 
 def _read_tts_settings() -> dict[str, str]:
